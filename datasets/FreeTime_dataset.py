@@ -241,10 +241,13 @@ class FreeTimeParser:
         if reference_colmap and os.path.exists(reference_colmap):
             colmap_dir = reference_colmap
         else:
+            # Priority: sparse/0 (reference COLMAP) > per-frame COLMAP
+            # IMPORTANT: sparse/0 should be preferred because it has cleaner points
+            # from traditional SfM. Per-frame COLMAP (from RoMa) has more outliers.
             candidates = [
-                os.path.join(sparse_dir, f"frame_{start_frame:06d}"),
+                os.path.join(sparse_dir, "0"),  # Reference COLMAP (clean SfM)
+                os.path.join(sparse_dir, f"frame_{start_frame:06d}"),  # Per-frame
                 os.path.join(sparse_dir, "frame_000000"),
-                os.path.join(sparse_dir, "0"),
                 os.path.join(data_dir, f"colmap_{start_frame}", "sparse/0"),
             ]
             for candidate in candidates:
@@ -739,6 +742,19 @@ def load_multiframe_colmap_points(data_dir: str,
             positions = positions[valid]
             colors = colors[valid]
 
+            # Additional spatial filtering: remove extreme outliers
+            # Points too far from the centroid are likely triangulation errors
+            if len(positions) > 100:
+                centroid = np.median(positions, axis=0)
+                dists_from_centroid = np.linalg.norm(positions - centroid, axis=1)
+                dist_threshold = np.percentile(dists_from_centroid, 99)  # Remove top 1%
+                spatial_valid = dists_from_centroid < dist_threshold
+                n_before = len(positions)
+                positions = positions[spatial_valid]
+                colors = colors[spatial_valid]
+                if n_before - len(positions) > 0:
+                    print(f"    Spatial filter: {n_before} -> {len(positions)} points")
+
             # Normalize time: (frame_idx - start_frame) / (end_frame - start_frame - 1)
             time = (frame_idx - start_frame) / max(total_frames - 1, 1)
 
@@ -972,6 +988,399 @@ def load_multiframe_colmap_points(data_dir: str,
     return result
 
 
+def load_multiframe_colmap_grid_tracked(
+    data_dir: str,
+    start_frame: int = 0,
+    end_frame: int = 50,
+    frame_step: int = 5,
+    grid_divisions: Tuple[int, int, int] = (10, 10, 4),  # Finer grid for better locality
+    max_points_per_cell: int = 2000,
+    match_threshold: float = 0.1,
+    max_error: float = 2.0,
+    transform: Optional[np.ndarray] = None
+) -> Dict[str, torch.Tensor]:
+    """
+    Load 3D points with grid-based stratified sampling and temporal tracking.
+
+    This approach ensures:
+    1. Full scene coverage - every grid cell is covered by some time step
+    2. Correspondences preserved - we track points, not randomly match
+    3. Better velocity - central difference from window of 3 frames
+
+    Algorithm:
+    1. Load all frames to get scene bounds and all points
+    2. Create 3D grid over scene bounds
+    3. Assign grid cells to time steps (round-robin)
+    4. For each time step t_i with assigned cells:
+       - Select points in those cells
+       - Track to t_{i-1} and t_{i+1} using KNN
+       - Compute velocity: v = (pos_{t+1} - pos_{t-1}) / (2*dt)
+    5. Combine all tracked points
+
+    Args:
+        data_dir: Path to data directory
+        start_frame: First frame index
+        end_frame: Last frame index (exclusive)
+        frame_step: Step between frames
+        grid_divisions: (nx, ny, nz) number of grid cells in each dimension
+        max_points_per_cell: Max points to keep per grid cell
+        match_threshold: KNN matching threshold
+        max_error: Max reprojection error filter
+        transform: Optional coordinate transform
+
+    Returns:
+        Dictionary with positions, times, velocities, colors, has_velocity
+    """
+    from scipy.spatial import cKDTree
+
+    sparse_dir = os.path.join(data_dir, "sparse")
+
+    # Find available COLMAP frames
+    frame_dirs = find_available_colmap_frames(sparse_dir, start_frame, end_frame)
+
+    # Filter by frame_step
+    if frame_step > 1:
+        frame_dirs = [(idx, path) for idx, path in frame_dirs
+                      if (idx - start_frame) % frame_step == 0]
+
+    n_frames = len(frame_dirs)
+    print(f"[GridTracked] Found {n_frames} frames in range [{start_frame}, {end_frame}) step={frame_step}")
+
+    if n_frames < 2:
+        raise ValueError(f"Need at least 2 frames for tracking, found {n_frames}")
+
+    total_frames = end_frame - start_frame
+
+    # Step 1: Load all frames to get scene bounds and point clouds
+    print("[GridTracked] Loading all frames...")
+    frame_data = {}  # frame_idx -> {positions, colors, time}
+    all_points_for_bounds = []
+
+    for frame_idx, colmap_path in frame_dirs:
+        try:
+            positions, colors, errors = _load_colmap_points(colmap_path)
+            if len(positions) == 0:
+                continue
+
+            # Filter by error
+            valid = errors < max_error
+            positions = positions[valid]
+            colors = colors[valid]
+
+            # Spatial filter: remove extreme outliers
+            if len(positions) > 100:
+                centroid = np.median(positions, axis=0)
+                dists = np.linalg.norm(positions - centroid, axis=1)
+                thresh = np.percentile(dists, 99)
+                spatial_valid = dists < thresh
+                positions = positions[spatial_valid]
+                colors = colors[spatial_valid]
+
+            time = (frame_idx - start_frame) / max(total_frames - 1, 1)
+
+            frame_data[frame_idx] = {
+                'positions': positions,
+                'colors': colors,
+                'time': time
+            }
+            all_points_for_bounds.append(positions)
+
+            print(f"  Frame {frame_idx} (t={time:.3f}): {len(positions)} points")
+
+        except Exception as e:
+            print(f"  Warning: Failed to load frame {frame_idx}: {e}")
+            continue
+
+    if len(frame_data) < 2:
+        raise ValueError("Need at least 2 valid frames for tracking")
+
+    # Step 2: Compute scene bounds from all points
+    all_points = np.concatenate(all_points_for_bounds, axis=0)
+    scene_min = np.percentile(all_points, 1, axis=0)  # Robust min
+    scene_max = np.percentile(all_points, 99, axis=0)  # Robust max
+    scene_extent = scene_max - scene_min
+
+    print(f"\n[GridTracked] Scene bounds:")
+    print(f"  Min: {scene_min}")
+    print(f"  Max: {scene_max}")
+    print(f"  Extent: {scene_extent}")
+
+    # Step 3: Create grid with helper functions
+    nx, ny, nz = grid_divisions
+    n_cells = nx * ny * nz
+
+    def get_cell_coords(pos):
+        """Get (ix, iy, iz) grid coordinates for positions.
+
+        NOTE: This normalizes positions ONLY for cell index assignment.
+        The actual positions used for velocity calculation remain in world coordinates.
+        """
+        norm_pos = (pos - scene_min) / (scene_extent + 1e-8)
+        norm_pos = np.clip(norm_pos, 0, 0.999)
+        ix = (norm_pos[:, 0] * nx).astype(int)
+        iy = (norm_pos[:, 1] * ny).astype(int)
+        iz = (norm_pos[:, 2] * nz).astype(int)
+        return ix, iy, iz
+
+    def coords_to_idx(ix, iy, iz):
+        """Convert grid coordinates to flat cell index."""
+        return ix + iy * nx + iz * nx * ny
+
+    def get_cell_idx(pos):
+        """Get flat grid cell index for positions."""
+        ix, iy, iz = get_cell_coords(pos)
+        return coords_to_idx(ix, iy, iz)
+
+    def get_neighbor_cells(ix, iy, iz, neighbor_radius=1):
+        """Get all neighboring cell indices including self."""
+        neighbors = []
+        for dix in range(-neighbor_radius, neighbor_radius + 1):
+            for diy in range(-neighbor_radius, neighbor_radius + 1):
+                for diz in range(-neighbor_radius, neighbor_radius + 1):
+                    nix = ix + dix
+                    niy = iy + diy
+                    niz = iz + diz
+                    # Check bounds
+                    if 0 <= nix < nx and 0 <= niy < ny and 0 <= niz < nz:
+                        neighbors.append(coords_to_idx(nix, niy, niz))
+        return neighbors
+
+    # Step 4: Pre-compute cell indices and group points by cell for each frame
+    print("\n[GridTracked] Building spatial index for each frame...")
+    frame_cell_data = {}  # frame_idx -> {cell_idx -> {'positions': [...], 'indices': [...]}}
+
+    for frame_idx, data in frame_data.items():
+        positions = data['positions']
+        cell_indices = get_cell_idx(positions)
+
+        # Group by cell
+        cell_groups = {}
+        for i, cell_idx in enumerate(cell_indices):
+            if cell_idx not in cell_groups:
+                cell_groups[cell_idx] = {'positions': [], 'point_indices': []}
+            cell_groups[cell_idx]['positions'].append(positions[i])
+            cell_groups[cell_idx]['point_indices'].append(i)
+
+        # Convert to numpy arrays for efficiency
+        for cell_idx in cell_groups:
+            cell_groups[cell_idx]['positions'] = np.array(cell_groups[cell_idx]['positions'])
+            cell_groups[cell_idx]['point_indices'] = np.array(cell_groups[cell_idx]['point_indices'])
+
+        frame_cell_data[frame_idx] = cell_groups
+
+    # Step 5: Assign grid cells to time steps (round-robin)
+    sorted_frame_indices = sorted(frame_data.keys())
+    n_time_steps = len(sorted_frame_indices)
+
+    cell_to_time = {}
+    for cell_idx in range(n_cells):
+        time_idx = cell_idx % n_time_steps
+        cell_to_time[cell_idx] = sorted_frame_indices[time_idx]
+
+    print(f"[GridTracked] Assigned {n_cells} cells to {n_time_steps} time steps")
+
+    # Step 6: Process each time step with neighbor-based tracking
+    all_positions = []
+    all_times = []
+    all_velocities = []
+    all_colors = []
+    all_has_velocity = []
+
+    for t_idx, frame_idx in enumerate(sorted_frame_indices):
+        data = frame_data[frame_idx]
+        positions = data['positions']
+        colors = data['colors']
+        time = data['time']
+
+        # Get cells assigned to this time step
+        assigned_cells = [c for c, f in cell_to_time.items() if f == frame_idx]
+        if len(assigned_cells) == 0:
+            continue
+
+        # Get points in assigned cells
+        cell_indices = get_cell_idx(positions)
+        in_assigned = np.isin(cell_indices, assigned_cells)
+
+        selected_positions = positions[in_assigned]
+        selected_colors = colors[in_assigned]
+        selected_cell_indices = cell_indices[in_assigned]
+
+        if len(selected_positions) == 0:
+            continue
+
+        # Subsample if too many points
+        max_pts = max_points_per_cell * len(assigned_cells)
+        if len(selected_positions) > max_pts:
+            idx = np.random.choice(len(selected_positions), max_pts, replace=False)
+            selected_positions = selected_positions[idx]
+            selected_colors = selected_colors[idx]
+            selected_cell_indices = selected_cell_indices[idx]
+
+        n_selected = len(selected_positions)
+
+        # Get previous and next frames
+        prev_frame_idx = sorted_frame_indices[t_idx - 1] if t_idx > 0 else None
+        next_frame_idx = sorted_frame_indices[t_idx + 1] if t_idx < n_time_steps - 1 else None
+
+        # Initialize velocity array
+        velocities = np.zeros((n_selected, 3), dtype=np.float32)
+        has_velocity = np.zeros(n_selected, dtype=bool)
+
+        # FAST TRACKING using KDTree per cell's neighbor region
+        valid_prev = np.zeros(n_selected, dtype=bool)
+        vel_backward = np.zeros((n_selected, 3), dtype=np.float32)
+        valid_next = np.zeros(n_selected, dtype=bool)
+        vel_forward = np.zeros((n_selected, 3), dtype=np.float32)
+
+        # Get cell indices for selected points
+        sel_cell_idx = get_cell_idx(selected_positions)
+        sel_ix, sel_iy, sel_iz = get_cell_coords(selected_positions)
+
+        # Group selected points by their cell for batch processing
+        unique_cells = np.unique(sel_cell_idx)
+
+        for cell_idx in unique_cells:
+            cell_mask = sel_cell_idx == cell_idx
+            cell_points = selected_positions[cell_mask]
+            cell_indices = np.where(cell_mask)[0]
+
+            if len(cell_points) == 0:
+                continue
+
+            # Get neighbor cells (use first point's coords)
+            first_pt_idx = cell_indices[0]
+            neighbors = get_neighbor_cells(sel_ix[first_pt_idx], sel_iy[first_pt_idx], sel_iz[first_pt_idx])
+
+            # Track to PREVIOUS frame using KDTree (FAST)
+            if prev_frame_idx is not None and prev_frame_idx in frame_cell_data:
+                prev_cells = frame_cell_data[prev_frame_idx]
+                prev_time = frame_data[prev_frame_idx]['time']
+                dt_prev = time - prev_time
+
+                candidate_pos_list = [prev_cells[nc]['positions'] for nc in neighbors if nc in prev_cells]
+                if candidate_pos_list:
+                    candidate_pos = np.concatenate(candidate_pos_list, axis=0)
+                    tree = cKDTree(candidate_pos)
+                    dists, indices = tree.query(cell_points, k=1)
+
+                    valid_mask = dists < match_threshold
+                    matched_prev_pos = candidate_pos[indices]
+
+                    valid_indices = cell_indices[valid_mask]
+                    valid_prev[valid_indices] = True
+                    vel_backward[valid_indices] = (cell_points[valid_mask] - matched_prev_pos[valid_mask]) / max(dt_prev, 1e-6)
+
+            # Track to NEXT frame using KDTree (FAST)
+            if next_frame_idx is not None and next_frame_idx in frame_cell_data:
+                next_cells = frame_cell_data[next_frame_idx]
+                next_time = frame_data[next_frame_idx]['time']
+                dt_next = next_time - time
+
+                candidate_pos_list = [next_cells[nc]['positions'] for nc in neighbors if nc in next_cells]
+                if candidate_pos_list:
+                    candidate_pos = np.concatenate(candidate_pos_list, axis=0)
+                    tree = cKDTree(candidate_pos)
+                    dists, indices = tree.query(cell_points, k=1)
+
+                    valid_mask = dists < match_threshold
+                    matched_next_pos = candidate_pos[indices]
+
+                    valid_indices = cell_indices[valid_mask]
+                    valid_next[valid_indices] = True
+                    vel_forward[valid_indices] = (matched_next_pos[valid_mask] - cell_points[valid_mask]) / max(dt_next, 1e-6)
+
+        # Compute final velocity using central difference where possible
+        # v = weighted_avg(vel_backward, vel_forward) if both available
+        both_valid = valid_prev & valid_next
+        only_prev = valid_prev & ~valid_next
+        only_next = valid_next & ~valid_prev
+
+        if both_valid.any():
+            # Central difference: weighted average of forward and backward
+            prev_dt = time - frame_data[prev_frame_idx]['time'] if prev_frame_idx else 0
+            next_dt = frame_data[next_frame_idx]['time'] - time if next_frame_idx else 0
+            total_dt = prev_dt + next_dt + 1e-8
+
+            w_fwd = prev_dt / total_dt
+            w_bwd = next_dt / total_dt
+
+            velocities[both_valid] = w_bwd * vel_backward[both_valid] + w_fwd * vel_forward[both_valid]
+            has_velocity[both_valid] = True
+
+        if only_prev.any():
+            velocities[only_prev] = vel_backward[only_prev]
+            has_velocity[only_prev] = True
+
+        if only_next.any():
+            velocities[only_next] = vel_forward[only_next]
+            has_velocity[only_next] = True
+
+        # Add to results
+        all_positions.append(selected_positions)
+        all_times.append(np.full((n_selected, 1), time, dtype=np.float32))
+        all_velocities.append(velocities)
+        all_colors.append(selected_colors)
+        all_has_velocity.append(has_velocity)
+
+        n_with_vel = has_velocity.sum()
+        print(f"  Time {time:.3f} (frame {frame_idx}): {n_selected} points, "
+              f"{n_with_vel} with velocity ({100*n_with_vel/n_selected:.1f}%)")
+
+    if len(all_positions) == 0:
+        raise ValueError("No points collected from grid-based tracking")
+
+    # Concatenate results
+    positions = np.concatenate(all_positions, axis=0)
+    times = np.concatenate(all_times, axis=0)
+    velocities = np.concatenate(all_velocities, axis=0)
+    colors = np.concatenate(all_colors, axis=0)
+    has_velocity = np.concatenate(all_has_velocity, axis=0)
+
+    print(f"\n[GridTracked] Total: {len(positions)} points")
+    print(f"  With velocity: {has_velocity.sum()} ({100*has_velocity.mean():.1f}%)")
+
+    # Apply coordinate transform
+    if transform is not None:
+        print(f"[GridTracked] Applying coordinate transform...")
+        transform_t = torch.from_numpy(transform).float()
+
+        positions_t = torch.from_numpy(positions).float()
+        ones = torch.ones(len(positions_t), 1)
+        positions_h = torch.cat([positions_t, ones], dim=1)
+        positions_transformed = (transform_t @ positions_h.T).T[:, :3]
+
+        R = transform_t[:3, :3]
+        velocities_t = torch.from_numpy(velocities).float()
+        velocities_transformed = velocities_t @ R.T
+
+        result = {
+            'positions': positions_transformed,
+            'times': torch.from_numpy(times).float(),
+            'velocities': velocities_transformed,
+            'colors': torch.from_numpy(colors).float() / 255.0,
+            'has_velocity': torch.from_numpy(has_velocity).bool(),
+        }
+    else:
+        result = {
+            'positions': torch.from_numpy(positions).float(),
+            'times': torch.from_numpy(times).float(),
+            'velocities': torch.from_numpy(velocities).float(),
+            'colors': torch.from_numpy(colors).float() / 255.0,
+            'has_velocity': torch.from_numpy(has_velocity).bool(),
+        }
+
+    print(f"\n[GridTracked] Final: {len(result['positions'])} points")
+    print(f"  Time range: [{result['times'].min():.3f}, {result['times'].max():.3f}]")
+
+    vel_mags = result['velocities'].norm(dim=1)
+    has_vel = result['has_velocity']
+    if has_vel.any():
+        print(f"  Velocity magnitude: min={vel_mags[has_vel].min():.4f}, "
+              f"max={vel_mags[has_vel].max():.4f}, mean={vel_mags[has_vel].mean():.4f}")
+
+    return result
+
+
 def load_single_frame_with_velocity(data_dir: str,
                                      start_frame: int = 0,
                                      end_frame: int = 300,
@@ -1131,7 +1540,7 @@ def load_startframe_tracked_velocity(data_dir: str,
                                       end_frame: int = 300,
                                       frame_step: int = 10,
                                       max_error: float = 2.0,
-                                      match_threshold: float = 0.1,
+                                      match_threshold: Optional[float] = None,
                                       transform: Optional[np.ndarray] = None) -> Dict[str, torch.Tensor]:
     """
     Load 3D points from START FRAME only and track them through subsequent frames
@@ -1154,7 +1563,8 @@ def load_startframe_tracked_velocity(data_dir: str,
         end_frame: Last frame index
         frame_step: Frame step for tracking (e.g., 10 means track through 0, 10, 20, ...)
         max_error: Maximum reprojection error filter
-        match_threshold: Maximum distance for KNN matching
+        match_threshold: Maximum distance for KNN matching. If None, computed adaptively
+                        based on scene scale and frame_step.
         transform: Optional [4, 4] transformation matrix
 
     Returns:
@@ -1189,8 +1599,39 @@ def load_startframe_tracked_velocity(data_dir: str,
     start_positions = start_positions[valid]
     start_colors = start_colors[valid]
 
+    # Additional spatial filtering: remove extreme outliers
+    if len(start_positions) > 100:
+        centroid = np.median(start_positions, axis=0)
+        dists_from_centroid = np.linalg.norm(start_positions - centroid, axis=1)
+        dist_threshold = np.percentile(dists_from_centroid, 99)  # Remove top 1%
+        spatial_valid = dists_from_centroid < dist_threshold
+        n_before = len(start_positions)
+        start_positions = start_positions[spatial_valid]
+        start_colors = start_colors[spatial_valid]
+        print(f"[StartFrameTracked] Spatial filter: {n_before} -> {len(start_positions)} points")
+
     N = len(start_positions)
     print(f"\n[StartFrameTracked] Start frame {start_frame_idx}: {N} points")
+
+    # Compute adaptive match_threshold if not provided
+    if match_threshold is None:
+        # Estimate scene scale from point cloud using k-nearest neighbor distances
+        sample_size = min(1000, N)
+        sample_idx = np.random.choice(N, sample_size, replace=False)
+        sample_pts = start_positions[sample_idx]
+
+        tree_sample = cKDTree(sample_pts)
+        # Get 5th nearest neighbor distance as robust scale estimate
+        dists, _ = tree_sample.query(sample_pts, k=6)  # k=6 because first is self
+        median_nn_dist = np.median(dists[:, 5])  # 5th NN distance
+
+        # Scale threshold by frame_step: larger steps mean more potential movement
+        # Base threshold: 10x median NN distance, scaled by sqrt(frame_step)
+        match_threshold = median_nn_dist * 10.0 * np.sqrt(frame_step)
+        print(f"[StartFrameTracked] Adaptive match_threshold: {match_threshold:.4f} "
+              f"(median_nn_dist={median_nn_dist:.4f}, frame_step={frame_step})")
+    else:
+        print(f"[StartFrameTracked] Using provided match_threshold: {match_threshold:.4f}")
 
     # Total frames for time normalization
     total_frames = end_frame - start_frame

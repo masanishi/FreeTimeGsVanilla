@@ -68,20 +68,53 @@ def similarity_from_cameras(
 
 def transform_cameras(T: np.ndarray, camtoworlds: np.ndarray) -> np.ndarray:
     """
-    Apply a transformation to camera-to-world matrices.
+    Apply a similarity transformation to camera-to-world matrices.
 
-    For camera poses C (cam-to-world), we want the new cam-to-world C' = T @ C
-    This puts cameras in the transformed coordinate system.
+    For a similarity transform T = [sR | t], we need to:
+    1. Transform camera positions: p' = sR @ p + t
+    2. Transform camera rotations: R' = R_T @ R (rotation only, no scale!)
+
+    This ensures the output cam-to-world matrices remain valid (orthonormal rotation).
 
     Args:
-        T: [4, 4] transformation matrix
+        T: [4, 4] similarity transformation matrix (may include scale)
         camtoworlds: [N, 4, 4] camera-to-world matrices
 
     Returns:
-        [N, 4, 4] transformed camera-to-world matrices
+        [N, 4, 4] transformed camera-to-world matrices with valid rotations
     """
-    # Batch matrix multiply: T @ camtoworlds[i] for all i
-    transformed = np.einsum('ij,njk->nik', T, camtoworlds)
+    N = len(camtoworlds)
+    transformed = np.zeros_like(camtoworlds)
+
+    # Extract rotation and scale from T
+    T_rot_scale = T[:3, :3]
+    T_trans = T[:3, 3]
+
+    # Decompose T_rot_scale into scale and rotation using SVD
+    U, S, Vt = np.linalg.svd(T_rot_scale)
+    scale = S[0]  # Assume uniform scale (S should be [s, s, s])
+    R_T = U @ Vt  # Pure rotation
+
+    # Ensure proper rotation (det = 1)
+    if np.linalg.det(R_T) < 0:
+        R_T = -R_T
+
+    for i in range(N):
+        c2w = camtoworlds[i]
+        R_cam = c2w[:3, :3]  # Camera rotation
+        t_cam = c2w[:3, 3]   # Camera position
+
+        # Transform rotation: R' = R_T @ R (keeps orthonormality)
+        R_new = R_T @ R_cam
+
+        # Transform position: t' = scale * R_T @ t + T_trans
+        t_new = scale * (R_T @ t_cam) + T_trans
+
+        # Build new c2w
+        transformed[i, :3, :3] = R_new
+        transformed[i, :3, 3] = t_new
+        transformed[i, 3, 3] = 1.0
+
     return transformed.astype(np.float32)
 
 

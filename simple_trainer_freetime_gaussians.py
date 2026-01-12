@@ -35,14 +35,14 @@ point clouds from Step 1 and initializes Gaussians with their velocities.
     # Quick test (100 steps, ~2 minutes)
     CUDA_VISIBLE_DEVICES=0 python simple_trainer_freetime_gaussians.py default \\
         --data-dir=/data/shared/elaheh/4D_demo/elly/undistorted \\
-        --result-dir=results/freetime_elly_test \\
+        --result-dir=/data/shared/elaheh/elly_free_roma_test \\
         --start-frame=0 --end-frame=10 \\
         --max-steps=100
 
     # Full training (30K steps, ~2-4 hours)
     CUDA_VISIBLE_DEVICES=0 python simple_trainer_freetime_gaussians.py default \\
         --data-dir=/data/shared/elaheh/4D_demo/elly/undistorted \\
-        --result-dir=results/freetime_elly \\
+        --result-dir=/data/shared/elaheh/elly_free_roma \\
         --start-frame=0 --end-frame=100 \\
         --max-steps=30000
 
@@ -50,7 +50,7 @@ Step 3: Monitor Training
 ------------------------
 Open TensorBoard to see training progress:
 
-    tensorboard --logdir=results/freetime_elly/tb --port=6006
+    tensorboard --logdir=/data/shared/elaheh/elly_free_roma/tb --port=6006
 
 Key metrics to watch:
     - train/loss: Should decrease steadily
@@ -61,10 +61,10 @@ Key metrics to watch:
 Step 4: Results
 ---------------
 After training, you'll find:
-    - results/freetime_elly/ckpts/     - Model checkpoints
-    - results/freetime_elly/renders/   - Validation images
-    - results/freetime_elly/videos/    - Time trajectory video
-    - results/freetime_elly/stats/     - Evaluation metrics (PSNR, SSIM, LPIPS)
+    - /data/shared/elaheh/elly_free_roma/ckpts/     - Model checkpoints
+    - /data/shared/elaheh/elly_free_roma/renders/   - Validation images
+    - /data/shared/elaheh/elly_free_roma/videos/    - Time trajectory video
+    - /data/shared/elaheh/elly_free_roma/stats/     - Evaluation metrics (PSNR, SSIM, LPIPS)
 
 ================================================================================
 Key Features
@@ -84,21 +84,21 @@ Usage Options
 # Basic training with elly dataset
 CUDA_VISIBLE_DEVICES=0 python simple_trainer_freetime_gaussians.py default \\
     --data-dir=/data/shared/elaheh/4D_demo/elly/undistorted \\
-    --result-dir=results/freetime_elly \\
+    --result-dir=/data/shared/elaheh/elly_free_roma \\
     --start-frame=0 --end-frame=100 \\
     --max-steps=30000
 
 # Quick test run (100 steps)
 CUDA_VISIBLE_DEVICES=0 python simple_trainer_freetime_gaussians.py fast \\
     --data-dir=/data/shared/elaheh/4D_demo/elly/undistorted \\
-    --result-dir=/tmp/test_freetime \\
+    --result-dir=/data/shared/elaheh/elly_free_roma_test \\
     --start-frame=0 --end-frame=10 \\
     --max-steps=100
 
 # Full training with paper's approach (relocation only, no densification)
 CUDA_VISIBLE_DEVICES=0 python simple_trainer_freetime_gaussians.py full \\
     --data-dir=/data/shared/elaheh/4D_demo/elly/undistorted \\
-    --result-dir=/data/shared/elaheh/freetime_elly_full \\
+    --result-dir=/data/shared/elaheh/elly_free_roma \\
     --start-frame=0 --end-frame=100 \\
     --max-steps=30000
 """
@@ -137,6 +137,7 @@ from datasets.FreeTime_dataset import (
     FreeTimeParser,
     FreeTimeDataset,
     load_multiframe_colmap_points,
+    load_multiframe_colmap_grid_tracked,
     load_single_frame_with_velocity,
     load_startframe_tracked_velocity,
 )
@@ -149,7 +150,7 @@ class FreeTimeConfig:
 
     # Data
     data_dir: str = "data/4d_scene"
-    result_dir: str = "results/freetime"
+    result_dir: str = "/data/shared/elaheh/elly_free_roma"
     data_factor: int = 1
 
     # Frame range
@@ -172,20 +173,22 @@ class FreeTimeConfig:
     # Model
     sh_degree: int = 3
     sh_degree_interval: int = 1000
-    init_opacity: float = 0.5  # Base opacity (temporal modulation reduces effective opacity)
-    init_scale: float = 1.0
+    max_init_points: int = 500_000  # Subsample to prevent color averaging with too many overlapping Gaussians
+    init_opacity: float = 0.1  # Low opacity to prevent color averaging
+    init_scale: float = 1.0  # Moderate scale - balance between coverage and color separation
     # Initial temporal duration (s in log scale: actual_duration = exp(log(s)))
-    # With s=0.3, temporal opacity at t=±0.5 from µt is:
-    #   exp(-0.5 * (0.5/0.3)^2) ≈ 0.06 (still visible)
-    # With s=0.1, temporal opacity at t=±0.5 from µt is:
-    #   exp(-0.5 * (0.5/0.1)^2) ≈ 0.0 (invisible!)
-    init_duration: float = 0.3  # Larger value = visible across more time
+    # Start with LARGE duration so ALL points are visible at ALL times initially.
+    # The model will learn to reduce duration during training to specialize Gaussians.
+    # With s=5.0, temporal opacity at any time t for point at mu_t:
+    #   At t=0, mu_t=1.0: exp(-0.5 * (1.0/5.0)^2) = exp(-0.02) ≈ 0.98 (visible!)
+    #   At t=0, mu_t=0.5: exp(-0.5 * (0.5/5.0)^2) = exp(-0.005) ≈ 0.995 (visible!)
+    init_duration: float = 5.0  # Large initial duration - all Gaussians visible at all times
 
     # Loss weights (from paper)
     lambda_img: float = 0.8
     lambda_ssim: float = 0.2
     lambda_perc: float = 0.01
-    lambda_reg: float = 1e-2  # 4D regularization weight (paper value)
+    lambda_reg: float = 1e-3  # Reduced from paper value (1e-2) to prevent opacity collapse
 
     # Densification strategy:
     # FreeTimeGS paper uses FIXED budget N with ONLY relocation:
@@ -204,7 +207,8 @@ class FreeTimeConfig:
     lambda_opacity: float = 0.5  # Weight for opacity in sampling score
 
     # Velocity annealing: λt = λ0^(1-t) + λ1^t
-    velocity_lr_start: float = 1e-2  # λ0
+    # NOTE: Reduced from 1e-2 to 5e-3 for stability
+    velocity_lr_start: float = 5e-3  # λ0 (reduced for stability)
     velocity_lr_end: float = 1e-4    # λ1
 
     # Rendering
@@ -231,7 +235,7 @@ class FreeTimeConfig:
     # Misc
     test_every: int = 8
     tb_every: int = 100
-    tb_image_every: int = 200  # Log images to tensorboard every N steps
+    tb_image_every: int = 100  # Log images to tensorboard every N steps (same as tb_every)
     disable_viewer: bool = True
     port: int = 8080
 
@@ -241,7 +245,9 @@ class FreeTimeConfig:
     # 3. "reference": Use reference COLMAP + random times
     # 4. "startframe": Use START frame points only, track through subsequent frames for velocity
     #                  All points at t=0 with computed velocity (recommended for tracking)
-    init_mode: str = "multiframe"
+    # 5. "grid_tracked": Grid-based stratified sampling with temporal tracking (recommended!)
+    #                    Ensures full scene coverage + better velocity from central difference
+    init_mode: str = "grid_tracked"  # Default to grid_tracked for best results
     use_velocity_init: bool = True
     velocity_npz_path: Optional[str] = None  # Pre-computed velocities (for reference mode)
     knn_match_threshold: float = 0.5
@@ -314,7 +320,7 @@ def create_freetime_splats_with_optimizers(
             start_frame=cfg.start_frame,
             end_frame=cfg.end_frame,
             frame_step=cfg.frame_step,
-            max_error=2.0,
+            max_error=1.0,  # Stricter filtering for RoMa triangulation
             match_threshold=0.1,
             transform=parser_transform,  # Apply coordinate alignment inside loader
         )
@@ -376,8 +382,8 @@ def create_freetime_splats_with_optimizers(
             start_frame=cfg.start_frame,
             end_frame=cfg.end_frame,
             frame_step=cfg.frame_step,
-            max_error=2.0,
-            match_threshold=0.1,
+            max_error=1.0,  # Stricter filtering for RoMa triangulation
+            match_threshold=None,  # Use adaptive threshold based on scene scale
             transform=parser_transform,
         )
 
@@ -390,6 +396,35 @@ def create_freetime_splats_with_optimizers(
         N = points.shape[0]
         print(f"[FreeTimeGS] Loaded {N} points from start frame (all at t=0)")
         print(f"[FreeTimeGS] Points with velocity: {has_velocity.sum().item()} ({100*has_velocity.sum()/N:.1f}%)")
+
+        # Add temporal diversity for points with velocity
+        # Spread time centers across [0, 1] and adjust positions accordingly
+        # Motion model: position(t) = position_init + velocity * (t - t_center)
+        # If we set t_center = tc and position_init = position_0 + velocity * tc,
+        # then at time t: position = position_0 + velocity * tc + velocity * (t - tc) = position_0 + velocity * t
+        vel_mask = has_velocity
+        n_vel_pts = vel_mask.sum().item()
+        if n_vel_pts > 0:
+            print(f"[FreeTimeGS] Adding temporal diversity to {n_vel_pts} points with velocity")
+            # Assign time centers uniformly spread across [0, 1]
+            vel_indices = torch.where(vel_mask)[0]
+            spread_times = torch.linspace(0.0, 1.0, n_vel_pts).unsqueeze(1)
+            # Shuffle to avoid spatial-temporal correlation
+            perm = torch.randperm(n_vel_pts)
+            spread_times = spread_times[perm]
+
+            # Adjust positions: position_init = position_0 + velocity * t_center
+            # So the motion model still works: pos(t) = pos_init + vel*(t-tc) = pos_0 + vel*t
+            new_times = times.clone()
+            new_points = points.clone()
+            for i, idx in enumerate(vel_indices):
+                tc = spread_times[i].item()
+                new_times[idx] = tc
+                new_points[idx] = points[idx] + velocities[idx] * tc
+
+            times = new_times
+            points = new_points
+            print(f"[FreeTimeGS] Time centers spread: min={times.min():.3f}, max={times.max():.3f}")
 
         # Velocity statistics
         vel_norms = velocities.norm(dim=1)
@@ -426,6 +461,42 @@ def create_freetime_splats_with_optimizers(
             has_velocity = has_velocity[sample_idx]
             N = points.shape[0]
 
+    elif cfg.init_mode == "grid_tracked":
+        # Grid-based stratified sampling with temporal tracking
+        # Best approach: ensures scene coverage + better velocity from central difference
+        print(f"[FreeTimeGS] Using grid-tracked initialization (recommended)...")
+        print(f"[FreeTimeGS] Grid-based stratified sampling with temporal window tracking")
+
+        parser_transform = parser.transform if hasattr(parser, 'transform') else None
+
+        init_data = load_multiframe_colmap_grid_tracked(
+            cfg.data_dir,
+            start_frame=cfg.start_frame,
+            end_frame=cfg.end_frame,
+            frame_step=cfg.frame_step,
+            grid_divisions=(10, 10, 4),  # 400 cells - finer grid for faster neighbor search
+            max_points_per_cell=2000,
+            match_threshold=0.1,
+            max_error=1.0,
+            transform=parser_transform,
+        )
+
+        points = init_data['positions']
+        times = init_data['times']
+        velocities = init_data['velocities']
+        rgbs = init_data['colors']
+        has_velocity = init_data['has_velocity']
+
+        N = points.shape[0]
+        print(f"[FreeTimeGS] Loaded {N} points with grid-tracked initialization")
+        print(f"[FreeTimeGS] Points with velocity: {has_velocity.sum().item()} ({100*has_velocity.float().mean():.1f}%)")
+
+        # Velocity statistics
+        vel_norms = velocities.norm(dim=1)
+        has_vel = vel_norms > 0.001
+        if has_vel.any():
+            print(f"[FreeTimeGS] Velocity stats: max={vel_norms.max():.4f}, mean={vel_norms[has_vel].mean():.4f}")
+
     else:
         # Original mode: use reference COLMAP
         print(f"[FreeTimeGS] Using reference COLMAP initialization...")
@@ -460,9 +531,45 @@ def create_freetime_splats_with_optimizers(
             n_matched = valid_matches.sum()
             print(f"[FreeTimeGS] Matched {n_matched}/{N} points with velocities")
 
+    # Filter points that are too far from camera center
+    # After normalization, cameras are at distance ~1 from origin
+    # Keep points within a reasonable multiple of scene_scale
+    scene_scale = parser.scene_scale
+    max_point_dist = 5.0 * scene_scale  # Keep points within 5x scene scale
+    point_dists = torch.norm(points, dim=1)
+    valid_points = point_dists < max_point_dist
+
+    n_before = len(points)
+    points = points[valid_points]
+    rgbs = rgbs[valid_points]
+    times = times[valid_points]
+    velocities = velocities[valid_points]
+    if 'has_velocity' in dir() and has_velocity is not None:
+        has_velocity = has_velocity[valid_points]
+
+    n_after = len(points)
+    print(f"[FreeTimeGS] Filtered points by distance: {n_before} -> {n_after} "
+          f"(removed {n_before - n_after} points beyond {max_point_dist:.1f} units)")
+
+    # Subsample if too many points (prevents color averaging from overlapping Gaussians)
+    max_pts = cfg.max_init_points if cfg.max_init_points is not None else 500_000
+    if max_pts > 0 and len(points) > max_pts:
+        idx = torch.randperm(len(points))[:max_pts]
+        points = points[idx]
+        rgbs = rgbs[idx]
+        times = times[idx]
+        velocities = velocities[idx]
+        if 'has_velocity' in dir() and has_velocity is not None:
+            has_velocity = has_velocity[idx]
+        print(f"[FreeTimeGS] Subsampled to {max_pts} points (was {n_after})")
+
+    N = points.shape[0]
+
     # Initialize spatial scale from KNN
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
     dist_avg = torch.sqrt(dist2_avg)
+    # Clamp to avoid log(0) = -inf for duplicate or very close points
+    dist_avg = torch.clamp(dist_avg, min=1e-6)
     scales = torch.log(dist_avg * cfg.init_scale).unsqueeze(-1).repeat(1, 3)
 
     # Distribute across ranks
@@ -484,16 +591,18 @@ def create_freetime_splats_with_optimizers(
     colors = torch.zeros((N, (cfg.sh_degree + 1) ** 2, 3))
     colors[:, 0, :] = rgb_to_sh(rgbs)
 
-    # Build parameter list with learning rates
-    scene_scale = parser.scene_scale
+    # Build parameter list with learning rates (scene_scale defined above)
+    # NOTE: Learning rates balance stability vs convergence speed
+    # - Higher LR for scales/opacities to allow Gaussians to grow and become visible
+    # - Lower LR for temporal params (times, durations, velocities) for stability
     params = [
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("times", torch.nn.Parameter(times), 1e-3),
-        ("durations", torch.nn.Parameter(durations), 1e-3),
-        ("velocities", torch.nn.Parameter(velocities), cfg.velocity_lr_start),
-        ("scales", torch.nn.Parameter(scales), 5e-3),
+        ("times", torch.nn.Parameter(times), 5e-4),      # Low: time should change slowly
+        ("durations", torch.nn.Parameter(durations), 5e-4),  # Low: duration should change slowly
+        ("velocities", torch.nn.Parameter(velocities), cfg.velocity_lr_start),  # 5e-3, annealed
+        ("scales", torch.nn.Parameter(scales), 1e-2),    # High LR to let scales grow quickly
         ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ("opacities", torch.nn.Parameter(opacities), 2e-2),  # Higher to let opacity increase
         ("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3),
         ("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20),
     ]
@@ -652,6 +761,7 @@ class FreeTimeGSRunner:
         # Standard Gaussian parameters
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
+        scales = torch.clamp(scales, max=1.0)  # Prevent giant Gaussians that cover entire scene
         base_opacity = torch.sigmoid(self.splats["opacities"])  # [N]
 
         # Modulate opacity with temporal opacity (Eq. 3)
@@ -722,8 +832,9 @@ class FreeTimeGSRunner:
         lambda_0 = self.cfg.velocity_lr_start
         lambda_1 = self.cfg.velocity_lr_end
 
-        # Annealing formula from paper
-        lr_scale = (lambda_0 ** (1 - t)) * (lambda_1 ** t)
+        # Annealing formula from paper: λt = λ0^(1-t) + λ1^t
+        # Uses addition not multiplication for proper interpolation
+        lr_scale = (lambda_0 ** (1 - t)) + (lambda_1 ** t)
 
         return lr_scale / lambda_0  # Return relative scale
 
@@ -887,6 +998,32 @@ class FreeTimeGSRunner:
 
             colors = renders[..., :3]
 
+            # DEBUG: Log rendering statistics every 100 steps
+            if step % 100 == 0:
+                temporal_op = info["temporal_opacity"]
+                base_op = torch.sigmoid(self.splats["opacities"])
+                effective_op = base_op * temporal_op
+
+                # Get Gaussian times
+                mu_t = self.splats["times"].squeeze()
+
+                print(f"\n[DEBUG step={step}] t={t:.3f}")
+                print(f"  Gaussian times: min={mu_t.min():.3f}, max={mu_t.max():.3f}, mean={mu_t.mean():.3f}")
+                print(f"  Temporal opacity: min={temporal_op.min():.4f}, max={temporal_op.max():.4f}, mean={temporal_op.mean():.4f}")
+                print(f"  Base opacity: min={base_op.min():.4f}, max={base_op.max():.4f}, mean={base_op.mean():.4f}")
+                print(f"  Effective opacity: min={effective_op.min():.4f}, max={effective_op.max():.4f}, mean={effective_op.mean():.4f}")
+                print(f"  Render alpha: min={alphas.min():.4f}, max={alphas.max():.4f}, mean={alphas.mean():.4f}")
+                print(f"  Render colors: min={colors.min():.4f}, max={colors.max():.4f}, mean={colors.mean():.4f}")
+                print(f"  GT pixels: min={pixels.min():.4f}, max={pixels.max():.4f}, mean={pixels.mean():.4f}")
+
+                # DEBUG: Check positions and scales
+                means = self.splats["means"]
+                scales = torch.exp(self.splats["scales"])
+                cam_pos = camtoworlds[0, :3, 3]
+                print(f"  Gaussian means: min={means.min():.3f}, max={means.max():.3f}")
+                print(f"  Gaussian scales: min={scales.min():.4f}, max={scales.max():.4f}, mean={scales.mean():.4f}")
+                print(f"  Camera position: {cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f}")
+
             # Strategy pre-backward (only if using DefaultStrategy)
             if cfg.use_default_strategy:
                 self.cfg.strategy.step_pre_backward(
@@ -963,25 +1100,76 @@ class FreeTimeGSRunner:
                 if len(self.splats["durations"]) > 0:
                     durations = torch.exp(self.splats["durations"]).detach()
                     self.writer.add_scalar("train/duration_mean", durations.mean().item(), step)
+                    self.writer.add_scalar("train/duration_min", durations.min().item(), step)
+                    self.writer.add_scalar("train/duration_max", durations.max().item(), step)
 
-                # Log images: rendered vs ground truth (side by side)
+                # Opacity statistics
+                if len(self.splats["opacities"]) > 0:
+                    base_opacity = torch.sigmoid(self.splats["opacities"]).detach()
+                    temporal_opacity = info["temporal_opacity"].detach()
+                    effective_opacity = base_opacity * temporal_opacity
+
+                    self.writer.add_scalar("train/base_opacity_mean", base_opacity.mean().item(), step)
+                    self.writer.add_scalar("train/temporal_opacity_mean", temporal_opacity.mean().item(), step)
+                    self.writer.add_scalar("train/effective_opacity_mean", effective_opacity.mean().item(), step)
+
+                    # Count visible Gaussians (effective opacity > threshold)
+                    n_visible = (effective_opacity > 0.01).sum().item()
+                    self.writer.add_scalar("train/n_visible_gaussians", n_visible, step)
+
+                # Time statistics
+                if len(self.splats["times"]) > 0:
+                    times_param = self.splats["times"].detach()
+                    self.writer.add_scalar("train/time_mean", times_param.mean().item(), step)
+                    self.writer.add_scalar("train/time_std", times_param.std().item(), step)
+
+                # Alpha (coverage) from rendered image
+                self.writer.add_scalar("train/alpha_mean", alphas.mean().item(), step)
+                self.writer.add_scalar("train/alpha_max", alphas.max().item(), step)
+
+                # Scale statistics (important for detecting collapse)
+                if len(self.splats["scales"]) > 0:
+                    scales_actual = torch.exp(self.splats["scales"]).detach()
+                    self.writer.add_scalar("train/scale_mean", scales_actual.mean().item(), step)
+                    self.writer.add_scalar("train/scale_min", scales_actual.min().item(), step)
+                    self.writer.add_scalar("train/scale_max", scales_actual.max().item(), step)
+
+                    # Warn if scales are getting too small
+                    if scales_actual.mean().item() < 1e-4:
+                        print(f"[WARNING] Scales shrinking! mean={scales_actual.mean():.6f}")
+
+                # Position statistics (detect drift)
+                if len(self.splats["means"]) > 0:
+                    means = self.splats["means"].detach()
+                    self.writer.add_scalar("train/position_std", means.std().item(), step)
+
+                # Log images: rendered vs ground truth vs alpha (side by side)
                 if step % cfg.tb_image_every == 0:
                     rendered = colors_clamped[0].detach()  # [H, W, 3] - already clamped
                     gt = pixels[0].detach()  # [H, W, 3]
+                    alpha = alphas[0].detach()  # [H, W, 1]
 
-                    # Create side-by-side comparison (GT left, Rendered right)
+                    # Convert alpha to RGB (grayscale)
+                    alpha_rgb = alpha.expand(-1, -1, 3)  # [H, W, 3]
+
+                    # Create side-by-side comparison: [GT | Rendered]
                     comparison = torch.cat([gt, rendered], dim=1)  # [H, 2W, 3]
 
-                    # Convert to [3, H, W] for tensorboard
-                    comparison = comparison.permute(2, 0, 1).contiguous()
-
-                    # Use consistent tag name so images appear in sequence
+                    # Log GT | Rendered comparison
                     self.writer.add_image(
-                        "train/gt_vs_render",
-                        comparison,
+                        "train/gt_render",
+                        comparison.permute(2, 0, 1).contiguous(),
                         step,
                     )
-                    print(f"[TensorBoard] Logged image at step {step}, t={t:.2f}")
+
+                    # Log alpha separately
+                    self.writer.add_image(
+                        "train/alpha",
+                        alpha_rgb.permute(2, 0, 1).contiguous(),
+                        step,
+                    )
+
+                    print(f"[TensorBoard] Logged images at step {step}, t={t:.2f}, alpha_mean={alpha.mean():.3f}")
 
                 self.writer.flush()
 
