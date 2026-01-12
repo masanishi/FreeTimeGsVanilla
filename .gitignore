@@ -1,0 +1,14 @@
+.venv/
+FreeTimeGsRoma/
+__pycache__/
+*.egg-info/
+results/
+debug_render*.png
+diag_render*.png
+test_renders*/
+*.mp4
+*.pt
+*.npz
+*.log
+uv.lock
+.claude/

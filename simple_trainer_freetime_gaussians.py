@@ -173,9 +173,9 @@ class FreeTimeConfig:
     # Model
     sh_degree: int = 3
     sh_degree_interval: int = 1000
-    max_init_points: int = 500_000  # Subsample to prevent color averaging with too many overlapping Gaussians
-    init_opacity: float = 0.1  # Low opacity to prevent color averaging
-    init_scale: float = 1.0  # Moderate scale - balance between coverage and color separation
+    max_init_points: int = 100_000  # Fewer points to prevent color averaging from overlapping Gaussians
+    init_opacity: float = 0.3  # Lower opacity to prevent saturation
+    init_scale: float = 1.0  # Smaller scale to reduce overlap
     # Initial temporal duration (s in log scale: actual_duration = exp(log(s)))
     # Start with LARGE duration so ALL points are visible at ALL times initially.
     # The model will learn to reduce duration during training to specialize Gaussians.
@@ -188,7 +188,7 @@ class FreeTimeConfig:
     lambda_img: float = 0.8
     lambda_ssim: float = 0.2
     lambda_perc: float = 0.01
-    lambda_reg: float = 1e-3  # Reduced from paper value (1e-2) to prevent opacity collapse
+    lambda_reg: float = 0.0  # Disabled - was causing opacity collapse after canonical phase
 
     # Densification strategy:
     # FreeTimeGS paper uses FIXED budget N with ONLY relocation:
@@ -199,12 +199,28 @@ class FreeTimeConfig:
     use_default_strategy: bool = False  # Paper uses relocation only, no densification
 
     # Periodic relocation (MCMC-style, always used)
-    use_periodic_relocation: bool = True
+    use_periodic_relocation: bool = False  # Disabled for debugging transition issues
     relocation_every: int = 100
     relocation_start_iter: int = 1000  # Delay relocation to let training stabilize
     relocation_opacity_threshold: float = 0.02  # Moderate threshold for 4D (accounts for temporal modulation)
     lambda_grad: float = 0.5  # Weight for gradient in sampling score
     lambda_opacity: float = 0.5  # Weight for opacity in sampling score
+
+    # Canonical phase: treat scene as static for first N iterations
+    # This helps learn basic appearance before temporal dynamics
+    # During canonical phase: freeze times/durations/velocities, train only spatial params
+    canonical_phase_steps: int = 2000
+    canonical_time: float = 0.5  # Fixed time during canonical phase (middle of sequence)
+
+    # Transition phase: gradual 4D enablement after canonical
+    # Phase 1 (0 to canonical_phase_steps): static_mode, fixed t=0.5
+    # Phase 2 (canonical to canonical+transition): motion enabled, but still fixed t=0.5
+    # Phase 3 (after transition): full 4D with varying time from data
+    transition_phase_steps: int = 1000  # Steps to transition after canonical
+
+    # Freeze temporal parameters - if True, don't train times/velocities at all
+    # Just use initialized values and only train spatial appearance
+    freeze_temporal_params: bool = True  # Recommended: keep velocities from initialization
 
     # Velocity annealing: λt = λ0^(1-t) + λ1^t
     # NOTE: Reduced from 1e-2 to 5e-3 for stability
@@ -251,7 +267,6 @@ class FreeTimeConfig:
     use_velocity_init: bool = True
     velocity_npz_path: Optional[str] = None  # Pre-computed velocities (for reference mode)
     knn_match_threshold: float = 0.5
-    max_init_points: Optional[int] = None  # Limit initial points (None = no limit)
 
 
 def create_freetime_splats_with_optimizers(
@@ -609,6 +624,28 @@ def create_freetime_splats_with_optimizers(
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
 
+    # DEBUG: Print initialization statistics
+    print("\n" + "="*70)
+    print("[INIT DEBUG] Gaussian initialization statistics:")
+    print("="*70)
+    print(f"  Number of Gaussians: {N}")
+    print(f"  Positions: min={points.min():.4f}, max={points.max():.4f}, mean={points.mean():.4f}")
+    print(f"  RGB colors: min={rgbs.min():.4f}, max={rgbs.max():.4f}, mean={rgbs.mean():.4f}")
+    sh0_vals = colors[:, 0, :]
+    print(f"  SH0 (DC): min={sh0_vals.min():.4f}, max={sh0_vals.max():.4f}, mean={sh0_vals.mean():.4f}")
+    scales_actual = torch.exp(scales)
+    print(f"  Scales (stored log): min={scales.min():.4f}, max={scales.max():.4f}")
+    print(f"  Scales (actual): min={scales_actual.min():.4f}, max={scales_actual.max():.4f}, mean={scales_actual.mean():.4f}")
+    opacities_actual = torch.sigmoid(opacities)
+    print(f"  Opacities (stored logit): {opacities[0].item():.4f}")
+    print(f"  Opacities (actual sigmoid): {opacities_actual[0].item():.4f}")
+    print(f"  Durations (stored log): {durations[0].item():.4f}")
+    print(f"  Durations (actual exp): {torch.exp(durations[0]).item():.4f}")
+    print(f"  Times: min={times.min():.4f}, max={times.max():.4f}, mean={times.mean():.4f}")
+    print(f"  Velocities: min={velocities.min():.4f}, max={velocities.max():.4f}, mean={velocities.mean():.4f}")
+    print(f"  Scene scale: {scene_scale:.4f}")
+    print("="*70 + "\n")
+
     # Create optimizers
     BS = cfg.batch_size * world_size
     optimizers = {
@@ -741,6 +778,7 @@ class FreeTimeGSRunner:
         height: int,
         t: float,
         sh_degree: int,
+        static_mode: bool = False,  # Canonical phase: no motion, all visible
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         """
@@ -750,18 +788,24 @@ class FreeTimeGSRunner:
         1. Compute moved positions: µx(t) = µx + v * (t - µt)  (Eq. 1)
         2. Compute temporal opacity: σ(t) = exp(-0.5 * ((t - µt) / s)^2)  (Eq. 4)
         3. Modulate opacity: σ_effective = σ * σ(t)  (Eq. 3)
+
+        If static_mode=True (canonical phase):
+        - Use original positions (no motion)
+        - Set temporal_opacity = 1.0 (all Gaussians visible)
         """
 
-        # Motion function: µx(t) = µx + v * (t - µt)
-        means = self.compute_moved_positions(t)  # [N, 3]
-
-        # Temporal opacity: σ(t) = exp(-0.5 * ((t - µt) / s)^2)
-        temporal_opacity = self.compute_temporal_opacity(t)  # [N]
+        if static_mode:
+            # CANONICAL PHASE: static scene, all Gaussians visible
+            means = self.splats["means"]  # Original positions, no motion
+            temporal_opacity = torch.ones(len(means), device=self.device)  # All visible
+        else:
+            # 4D mode: apply motion and temporal opacity
+            means = self.compute_moved_positions(t)  # [N, 3]
+            temporal_opacity = self.compute_temporal_opacity(t)  # [N]
 
         # Standard Gaussian parameters
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
-        scales = torch.clamp(scales, max=1.0)  # Prevent giant Gaussians that cover entire scene
         base_opacity = torch.sigmoid(self.splats["opacities"])  # [N]
 
         # Modulate opacity with temporal opacity (Eq. 3)
@@ -961,6 +1005,13 @@ class FreeTimeGSRunner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(max_steps))
 
+        # Log canonical phase settings
+        if cfg.canonical_phase_steps > 0:
+            print(f"\n[CANONICAL PHASE] First {cfg.canonical_phase_steps} steps: static scene at t={cfg.canonical_time}")
+            print(f"  Frozen: times, durations, velocities")
+            print(f"  Training: means, scales, quats, opacities, colors")
+            print(f"  After step {cfg.canonical_phase_steps}: full 4D training\n")
+
         for step in pbar:
             # Load batch
             try:
@@ -972,17 +1023,88 @@ class FreeTimeGSRunner:
             camtoworlds = data["camtoworld"].to(device)  # [B, 4, 4]
             Ks = data["K"].to(device)  # [B, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [B, H, W, 3]
-            t = data["time"].to(device).mean().item()  # Scalar time
+
+            # THREE-PHASE TRAINING:
+            # Phase 1 (canonical): static_mode, t=0.5, temporal params frozen
+            # Phase 2 (transition): motion enabled, t=0.5 still fixed, temporal params learning
+            # Phase 3 (full 4D): motion enabled, t from data
+            transition_end = cfg.canonical_phase_steps + cfg.transition_phase_steps
+            in_canonical_phase = step < cfg.canonical_phase_steps
+            in_transition_phase = cfg.canonical_phase_steps <= step < transition_end
+            in_full_4d_phase = step >= transition_end
+
+            if in_canonical_phase or in_transition_phase:
+                t = cfg.canonical_time  # Fixed time (default 0.5 = middle)
+            else:
+                t = data["time"].to(device).mean().item()  # Actual time from data
+
+            # IMPORTANT: Don't use static_mode anymore!
+            # static_mode causes position discontinuity when transitioning to 4D
+            # Instead, always use normal 4D rendering (motion applied)
+            # During canonical phase, temporal params are frozen but motion is still applied
+            # This ensures positions are consistent: pos = means + vel * (t - mu_t)
+            use_static_mode = False  # Always use 4D rendering for consistent positions
+
+            # Log phase transitions
+            if step == cfg.canonical_phase_steps:
+                print(f"\n" + "="*70)
+                print(f"[TRANSITION PHASE START] Step {step}")
+                print(f"  Motion ENABLED, but still fixed t={cfg.canonical_time}")
+                print(f"  Now training: times, durations, velocities")
+                print(f"  Transition ends at step {transition_end}")
+                print(f"="*70)
+
+            if step == transition_end:
+                print(f"\n" + "="*70)
+                print(f"[FULL 4D PHASE START] Step {step}")
+                print(f"  Now using varying time t from data")
+                print(f"="*70)
+                # Debug: show current state of 4D parameters
+                with torch.no_grad():
+                    times = self.splats["times"].squeeze()
+                    durations = torch.exp(self.splats["durations"]).squeeze()
+                    velocities = self.splats["velocities"]
+                    means = self.splats["means"]
+                    base_op = torch.sigmoid(self.splats["opacities"])
+                    print(f"  Times: min={times.min():.4f}, max={times.max():.4f}, mean={times.mean():.4f}")
+                    print(f"  Durations: min={durations.min():.4f}, max={durations.max():.4f}, mean={durations.mean():.4f}")
+                    print(f"  Velocities: min={velocities.min():.4f}, max={velocities.max():.4f}, mean={velocities.mean():.4f}")
+                    print(f"  Velocity magnitudes: min={velocities.norm(dim=-1).min():.4f}, max={velocities.norm(dim=-1).max():.4f}")
+                    print(f"  Base opacity: min={base_op.min():.4f}, max={base_op.max():.4f}, mean={base_op.mean():.4f}")
+                    print(f"  Means: min={means.min():.4f}, max={means.max():.4f}")
+                    # Test: what would temporal opacity be at t=0 vs t=1?
+                    for test_t in [0.0, 0.5, 1.0]:
+                        dt = test_t - times
+                        temp_op = torch.exp(-0.5 * (dt / (durations + 1e-8)) ** 2)
+                        # Also compute position displacement
+                        displacement = velocities * dt.unsqueeze(-1)
+                        disp_mag = displacement.norm(dim=-1)
+                        print(f"  At t={test_t}: temp_op mean={temp_op.mean():.4f}, position displacement: min={disp_mag.min():.4f}, max={disp_mag.max():.4f}, mean={disp_mag.mean():.4f}")
+                print(f"="*70 + "\n")
 
             height, width = pixels.shape[1:3]
 
             # SH degree schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # Update velocity learning rate (annealing)
-            vel_lr_scale = self.get_velocity_lr_scale(step, max_steps)
+            # Update temporal parameter learning rates
+            # If freeze_temporal_params=True, keep LR=0 always (use initialized values)
+            if cfg.freeze_temporal_params or in_canonical_phase:
+                vel_lr = 0.0
+                times_lr = 0.0
+                durations_lr = 0.0
+            else:
+                vel_lr_scale = self.get_velocity_lr_scale(step, max_steps)
+                vel_lr = cfg.velocity_lr_start * vel_lr_scale * math.sqrt(cfg.batch_size)
+                times_lr = 5e-4 * math.sqrt(cfg.batch_size)
+                durations_lr = 5e-4 * math.sqrt(cfg.batch_size)
+
             for param_group in self.optimizers["velocities"].param_groups:
-                param_group["lr"] = cfg.velocity_lr_start * vel_lr_scale * math.sqrt(cfg.batch_size)
+                param_group["lr"] = vel_lr
+            for param_group in self.optimizers["times"].param_groups:
+                param_group["lr"] = times_lr
+            for param_group in self.optimizers["durations"].param_groups:
+                param_group["lr"] = durations_lr
 
             # Forward pass: render at time t
             renders, alphas, info = self.rasterize_at_time(
@@ -992,6 +1114,7 @@ class FreeTimeGSRunner:
                 height=height,
                 t=t,
                 sh_degree=sh_degree_to_use,
+                static_mode=use_static_mode,  # Only static during canonical, transition uses motion
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
             )
@@ -1007,7 +1130,13 @@ class FreeTimeGSRunner:
                 # Get Gaussian times
                 mu_t = self.splats["times"].squeeze()
 
-                print(f"\n[DEBUG step={step}] t={t:.3f}")
+                if in_canonical_phase:
+                    phase_label = "CANONICAL/STATIC"
+                elif in_transition_phase:
+                    phase_label = "TRANSITION (t=0.5, motion ON)"
+                else:
+                    phase_label = "FULL 4D"
+                print(f"\n[DEBUG step={step}] t={t:.3f} mode={phase_label}")
                 print(f"  Gaussian times: min={mu_t.min():.3f}, max={mu_t.max():.3f}, mean={mu_t.mean():.3f}")
                 print(f"  Temporal opacity: min={temporal_op.min():.4f}, max={temporal_op.max():.4f}, mean={temporal_op.mean():.4f}")
                 print(f"  Base opacity: min={base_op.min():.4f}, max={base_op.max():.4f}, mean={base_op.mean():.4f}")
@@ -1061,8 +1190,11 @@ class FreeTimeGSRunner:
                 cfg.lambda_perc * lpips_loss
             )
 
-            # 4D regularization loss
-            reg_loss = self.compute_4d_regularization(info["temporal_opacity"])
+            # 4D regularization loss (disabled during canonical phase to prevent opacity collapse)
+            if in_canonical_phase:
+                reg_loss = torch.zeros(1, device=self.device)
+            else:
+                reg_loss = self.compute_4d_regularization(info["temporal_opacity"])
 
             # Total loss
             loss = render_loss + cfg.lambda_reg * reg_loss
@@ -1071,8 +1203,14 @@ class FreeTimeGSRunner:
             loss.backward()
 
             # Progress bar
+            if in_canonical_phase:
+                phase_str = "[STATIC]"
+            elif in_transition_phase:
+                phase_str = "[TRANS]"
+            else:
+                phase_str = "[4D]"
             desc = (
-                f"loss={loss.item():.4f} | "
+                f"{phase_str} loss={loss.item():.4f} | "
                 f"l1={l1_loss.item():.4f} | "
                 f"reg={reg_loss.item():.4f} | "
                 f"t={t:.2f} | "
@@ -1088,7 +1226,8 @@ class FreeTimeGSRunner:
                 self.writer.add_scalar("train/lpips_loss", lpips_loss.item(), step)
                 self.writer.add_scalar("train/reg_loss", reg_loss.item(), step)
                 self.writer.add_scalar("train/num_gaussians", len(self.splats["means"]), step)
-                self.writer.add_scalar("train/vel_lr_scale", vel_lr_scale, step)
+                self.writer.add_scalar("train/vel_lr", vel_lr, step)
+                self.writer.add_scalar("train/in_canonical_phase", float(in_canonical_phase), step)
 
                 # Velocity statistics (guard against empty)
                 if len(self.splats["velocities"]) > 0:
@@ -1220,7 +1359,8 @@ class FreeTimeGSRunner:
             # - DefaultStrategy: split/clone/prune based on gradients and opacity
             # - Periodic relocation: move low-opacity Gaussians to high-score regions
             # Without this, model uses more low-opacity Gaussians (suboptimal when N is limited)
-            if cfg.use_periodic_relocation and step >= cfg.relocation_start_iter and step % cfg.relocation_every == 0:
+            # Disabled during canonical phase since we're training static scene
+            if cfg.use_periodic_relocation and not in_canonical_phase and step >= cfg.relocation_start_iter and step % cfg.relocation_every == 0:
                 n_relocated = self.periodic_relocation(step, info)
                 if self.world_rank == 0:
                     self.writer.add_scalar("train/n_relocated", n_relocated, step)
