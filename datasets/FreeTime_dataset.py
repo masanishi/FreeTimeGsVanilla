@@ -294,15 +294,16 @@ class FreeTimeParser:
 
             # Extract rotation and translation based on API
             if PYCOLMAP_API == "new":
-                # New API: im.cam_from_world.rotation.quat gives [x, y, z, w]
-                quat = im.cam_from_world.rotation.quat
+                # New API: cam_from_world() is a method returning Rigid3d
+                pose = im.cam_from_world()  # Call as method
+                quat = pose.rotation.quat  # [x, y, z, w]
                 x, y, z, w = quat
                 rot = np.array([
                     [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
                     [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
                     [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
                 ])
-                trans = np.array(im.cam_from_world.translation).reshape(3, 1)
+                trans = np.array(pose.translation).reshape(3, 1)
             else:
                 # Old API: im.R() gives rotation matrix, im.tvec gives translation
                 rot = im.R()
@@ -781,6 +782,17 @@ def load_multiframe_colmap_points(data_dir: str,
 
                     # Velocity in normalized time units (world_units per normalized_time_unit)
                     velocities = (matched_curr - matched_prev) / dt
+
+                    # Cap large velocities (likely from noisy COLMAP matches)
+                    # A velocity of 1.0 means moving 1 world unit over the full time range [0,1]
+                    # For most scenes, velocities > 0.5 are likely noise
+                    max_velocity = 0.5  # world units per normalized time
+                    vel_mag = np.linalg.norm(velocities, axis=1, keepdims=True)
+                    vel_scale = np.clip(max_velocity / (vel_mag + 1e-8), a_min=None, a_max=1.0)
+                    n_capped = (vel_mag.squeeze() > max_velocity).sum()
+                    if n_capped > 0:
+                        print(f"      Capped {n_capped}/{n_matched} large velocities (>{max_velocity:.2f})")
+                    velocities = velocities * vel_scale
 
                     all_positions.append(matched_prev)
                     all_times.append(np.full((n_matched, 1), prev_time, dtype=np.float32))
@@ -1315,6 +1327,16 @@ def load_multiframe_colmap_grid_tracked(
             velocities[only_next] = vel_forward[only_next]
             has_velocity[only_next] = True
 
+        # Cap large velocities (likely from noisy matches)
+        max_velocity = 0.5  # world units per normalized time
+        vel_mag = np.linalg.norm(velocities, axis=1, keepdims=True)
+        large_vel_mask = (vel_mag.squeeze() > max_velocity) & has_velocity
+        n_capped = large_vel_mask.sum()
+        if n_capped > 0:
+            vel_scale = np.clip(max_velocity / (vel_mag + 1e-8), a_min=None, a_max=1.0)
+            velocities = velocities * vel_scale
+            print(f"    Capped {n_capped} large velocities (>{max_velocity:.2f})")
+
         # Add to results
         all_positions.append(selected_positions)
         all_times.append(np.full((n_selected, 1), time, dtype=np.float32))
@@ -1759,6 +1781,170 @@ def load_startframe_tracked_velocity(data_dir: str,
 
     print(f"\n[StartFrameTracked] Final: {N} points at t=0")
     print(f"  With velocity: {result['has_velocity'].sum().item()} ({100*result['has_velocity'].sum().item()/N:.1f}%)")
+
+    vel_mags = result['velocities'].norm(dim=1)
+    has_vel = result['has_velocity']
+    if has_vel.any():
+        print(f"  Velocity magnitude: "
+              f"min={vel_mags[has_vel].min():.4f}, "
+              f"max={vel_mags[has_vel].max():.4f}, "
+              f"mean={vel_mags[has_vel].mean():.4f}")
+
+    return result
+
+
+def load_roma_points(
+    data_dir: str,
+    start_frame: int = 0,
+    end_frame: int = 300,
+    frame_step: int = 1,
+    max_velocity: float = 0.5,
+    transform: Optional[np.ndarray] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Load Roma triangulated points from per-frame npy files.
+
+    Files expected:
+    - points3d_frame{frame:06d}.npy - [N, 3] 3D points
+    - colors_frame{frame:06d}.npy - [N, 3] RGB colors (0-255)
+
+    Args:
+        data_dir: Path to data directory containing npy files
+        start_frame: First frame index
+        end_frame: Last frame index
+        frame_step: Step between frames
+        max_velocity: Cap velocities at this value
+        transform: Optional 4x4 transform matrix
+
+    Returns:
+        Dictionary with positions, times, velocities, colors, has_velocity
+    """
+    from scipy.spatial import cKDTree
+
+    print(f"\n[RomaPoints] Loading Roma triangulated points...")
+    print(f"  Data dir: {data_dir}")
+    print(f"  Frame range: [{start_frame}, {end_frame}) step={frame_step}")
+
+    # Find available Roma point files
+    roma_frames = []
+    for frame_idx in range(start_frame, end_frame, frame_step):
+        points_file = os.path.join(data_dir, f"points3d_frame{frame_idx:06d}.npy")
+        colors_file = os.path.join(data_dir, f"colors_frame{frame_idx:06d}.npy")
+        if os.path.exists(points_file) and os.path.exists(colors_file):
+            roma_frames.append(frame_idx)
+
+    if len(roma_frames) == 0:
+        raise ValueError(f"No Roma point files found in {data_dir}")
+
+    print(f"  Found {len(roma_frames)} Roma frames")
+
+    total_frames = end_frame - start_frame
+
+    all_positions = []
+    all_times = []
+    all_velocities = []
+    all_colors = []
+    all_has_velocity = []
+
+    prev_points = None
+    prev_time = None
+    prev_frame_idx = None
+
+    for i, frame_idx in enumerate(tqdm(roma_frames, desc="Loading Roma frames")):
+        # Normalized time
+        time = (frame_idx - start_frame) / max(total_frames - 1, 1)
+
+        # Load points and colors
+        points_file = os.path.join(data_dir, f"points3d_frame{frame_idx:06d}.npy")
+        colors_file = os.path.join(data_dir, f"colors_frame{frame_idx:06d}.npy")
+
+        positions = np.load(points_file).astype(np.float32)
+        colors = np.load(colors_file).astype(np.float32)
+
+        # Normalize colors to [0, 1]
+        if colors.max() > 1.0:
+            colors = colors / 255.0
+
+        N = len(positions)
+
+        # Initialize velocity as zero
+        velocities = np.zeros((N, 3), dtype=np.float32)
+        has_velocity = np.zeros(N, dtype=bool)
+
+        # Match with previous frame to compute velocity
+        if prev_points is not None and len(prev_points) > 0:
+            dt = time - prev_time
+            if dt > 1e-6:
+                # Build KD-tree for current points
+                tree = cKDTree(positions)
+
+                # Find nearest neighbors for previous points
+                dists, indices = tree.query(prev_points, k=1)
+
+                # Match threshold (in world units)
+                match_threshold = 0.1
+                valid_matches = dists < match_threshold
+
+                if valid_matches.sum() > 0:
+                    # For matched points, compute velocity
+                    matched_prev = prev_points[valid_matches]
+                    matched_curr = positions[indices[valid_matches]]
+
+                    # Velocity = (curr - prev) / dt
+                    vel = (matched_curr - matched_prev) / dt
+
+                    # Cap large velocities
+                    vel_mag = np.linalg.norm(vel, axis=1, keepdims=True)
+                    vel_scale = np.clip(max_velocity / (vel_mag + 1e-8), a_min=None, a_max=1.0)
+                    vel = vel * vel_scale
+
+                    # Assign velocity to matched current points
+                    matched_indices = indices[valid_matches]
+                    velocities[matched_indices] = vel
+                    has_velocity[matched_indices] = True
+
+                    n_matched = valid_matches.sum()
+                    n_capped = (vel_mag.squeeze() > max_velocity).sum()
+                    print(f"  Frame {frame_idx}: {N} pts, {n_matched} matched, {n_capped} vel capped")
+
+        all_positions.append(positions)
+        all_times.append(np.full((N, 1), time, dtype=np.float32))
+        all_velocities.append(velocities)
+        all_colors.append(colors)
+        all_has_velocity.append(has_velocity)
+
+        prev_points = positions
+        prev_time = time
+        prev_frame_idx = frame_idx
+
+    # Concatenate all
+    positions = np.concatenate(all_positions, axis=0)
+    times = np.concatenate(all_times, axis=0)
+    velocities = np.concatenate(all_velocities, axis=0)
+    colors = np.concatenate(all_colors, axis=0)
+    has_velocity = np.concatenate(all_has_velocity, axis=0)
+
+    # Apply transform if provided
+    if transform is not None:
+        R = transform[:3, :3]
+        t = transform[:3, 3]
+        positions = (positions @ R.T) + t
+        velocities = velocities @ R.T
+
+    result = {
+        'positions': torch.from_numpy(positions).float(),
+        'times': torch.from_numpy(times).float(),
+        'velocities': torch.from_numpy(velocities).float(),
+        'colors': torch.from_numpy(colors).float(),
+        'has_velocity': torch.from_numpy(has_velocity).bool(),
+    }
+
+    N = len(result['positions'])
+    n_with_vel = result['has_velocity'].sum().item()
+
+    print(f"\n[RomaPoints] Final: {N} points")
+    print(f"  Time range: [{result['times'].min():.3f}, {result['times'].max():.3f}]")
+    print(f"  With velocity: {n_with_vel} ({100*n_with_vel/N:.1f}%)")
 
     vel_mags = result['velocities'].norm(dim=1)
     has_vel = result['has_velocity']
