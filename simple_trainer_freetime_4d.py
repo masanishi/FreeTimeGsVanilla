@@ -492,9 +492,9 @@ class Config:
     """Maximum difficulty weight multiplier. Prevents extreme weights
     that could destabilize training. Range: [1, motion_weight_max]."""
 
-    motion_weight_start_iter: int = 3000
+    motion_weight_start_iter: int = 15000
     """Start applying motion-weighted loss after this iteration.
-    Should be after canonical phase when velocities are being learned."""
+    Should be well after canonical phase so velocities/durations are established first."""
 
     # ==================== Temporal Coverage Densification ====================
     use_temporal_densification: bool = True
@@ -504,8 +504,9 @@ class Config:
     temporal_densify_every: int = 500
     """Check for temporal coverage gaps every N iterations."""
 
-    temporal_densify_start_iter: int = 5000
-    """Start temporal densification after this iteration."""
+    temporal_densify_start_iter: int = 15000
+    """Start temporal densification after this iteration.
+    Should wait until velocities/durations are learned to identify coverage gaps."""
 
     temporal_densify_stop_iter: int = 40000
     """Stop temporal densification after this iteration."""
