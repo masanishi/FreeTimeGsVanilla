@@ -400,17 +400,25 @@ class FreeTimeParser:
         colmap_format = _detect_colmap_format(imdata)
         print(f"[FreeTimeParser] Detected COLMAP format: {colmap_format}")
 
+        # Debug: show first few COLMAP image names
+        colmap_image_names = [imdata[k].name for k in imdata]
+        print(f"[FreeTimeParser] First 3 COLMAP image names: {colmap_image_names[:3]}")
+
         if colmap_format == "flat":
             camera_names = [Path(imdata[k].name).stem for k in imdata]
         else:
             # Nested format: 002-002/000000.jpg -> use parent folder name
             camera_names = [Path(imdata[k].name).parent.name for k in imdata]
 
+        print(f"[FreeTimeParser] First 3 extracted camera names: {camera_names[:3]}")
+
         # Sort by camera name
         inds = np.argsort(camera_names)
         camera_names = [camera_names[i] for i in inds]
         camtoworlds = camtoworlds[inds]
         camera_ids = [camera_ids[i] for i in inds]
+
+        print(f"[FreeTimeParser] First 3 sorted camera names: {camera_names[:3]}")
 
         # 3D points - use helper function that handles both APIs
         points, points_rgb, points_err = _load_colmap_points(colmap_dir)
@@ -431,10 +439,30 @@ class FreeTimeParser:
 
         # Camera paths (folders containing images)
         images_dir = os.path.join(data_dir, "images")
-        self.campaths = [os.path.join(images_dir, x)
-                        for x in sorted(os.listdir(images_dir))]
+        folder_names = sorted(os.listdir(images_dir))
+        self.campaths = [os.path.join(images_dir, x) for x in folder_names]
 
         print(f"[FreeTimeParser] Found {len(self.campaths)} camera folders")
+
+        # CRITICAL: Verify camera_names from COLMAP match folder names
+        # This ensures camtoworlds[i] corresponds to campaths[i]
+        if len(camera_names) != len(folder_names):
+            print(f"[WARNING] Camera count mismatch! COLMAP: {len(camera_names)}, Folders: {len(folder_names)}")
+
+        mismatches = []
+        for i, (colmap_name, folder_name) in enumerate(zip(camera_names, folder_names)):
+            if colmap_name != folder_name:
+                mismatches.append((i, colmap_name, folder_name))
+
+        if mismatches:
+            print(f"[WARNING] Camera name mismatches detected ({len(mismatches)}):")
+            for i, colmap_name, folder_name in mismatches[:5]:  # Show first 5
+                print(f"  Index {i}: COLMAP='{colmap_name}' vs Folder='{folder_name}'")
+            if len(mismatches) > 5:
+                print(f"  ... and {len(mismatches) - 5} more")
+            print("[WARNING] This may cause GT/render mismatch! Check your COLMAP reconstruction.")
+        else:
+            print(f"[FreeTimeParser] ✓ All {len(camera_names)} camera names match folder names")
 
         # Auto-detect image format from first camera folder
         if image_format is None or frame_digits is None or frame_start is None:
@@ -1953,6 +1981,266 @@ def load_roma_points(
               f"min={vel_mags[has_vel].min():.4f}, "
               f"max={vel_mags[has_vel].max():.4f}, "
               f"mean={vel_mags[has_vel].mean():.4f}")
+
+    return result
+
+
+def load_windowed_points(
+    npz_path: str,
+    max_velocity: float = 0.5,
+    max_angular_velocity: float = 0.5,
+    transform: Optional[np.ndarray] = None,
+    # Sampling parameters
+    max_samples: int = 0,  # 0 = no sampling, use all points
+    n_times: int = 3,  # Number of time windows to sample from
+    high_velocity_ratio: float = 0.8,  # Ratio of high-velocity samples
+    grid_resolution: int = 50,  # Spatial grid for coverage sampling
+    sample_frame_start: int = 0,  # Frame range for sampling
+    sample_frame_end: int = 300,
+) -> Dict[str, torch.Tensor]:
+    """
+    Load windowed triangulated points with velocity from triangulate_windowed.py output.
+
+    The windowed approach:
+    - Tracks points within short temporal windows (e.g., 3 frames)
+    - More points get velocity estimates (they only need to survive the window)
+    - Each point has a time (middle of window) and duration (window span)
+    - Each point has angular velocity estimated from local neighborhood rotation
+
+    Sampling (when max_samples > 0):
+    - Selects n_times time windows evenly across the sequence
+    - For each time: 80% from high velocity regions, 20% random spatial coverage
+    - Ensures both motion-rich regions and spatial coverage are represented
+
+    Args:
+        npz_path: Path to .npz file from triangulate_windowed.py
+        max_velocity: Cap linear velocities at this value
+        max_angular_velocity: Cap angular velocities at this value (radians per frame)
+        transform: Optional 4x4 transform matrix for coordinate alignment
+        max_samples: Maximum samples (0 = no sampling)
+        n_times: Number of time windows to sample from
+        high_velocity_ratio: Ratio of high-velocity samples (0.8 = 80%)
+        grid_resolution: Spatial grid resolution for coverage sampling
+        sample_frame_start: Start frame for sampling filter
+        sample_frame_end: End frame for sampling filter
+
+    Returns:
+        Dictionary with positions, times, velocities, angular_velocities, colors, has_velocity, durations
+    """
+    print(f"\n[WindowedPoints] Loading windowed triangulated points...")
+    print(f"  NPZ path: {npz_path}")
+
+    if not os.path.exists(npz_path):
+        raise ValueError(f"Windowed points file not found: {npz_path}")
+
+    # Load npz file
+    data = np.load(npz_path)
+
+    positions = data['positions'].astype(np.float32)
+    velocities = data['velocities'].astype(np.float32)
+    colors = data['colors'].astype(np.float32)
+    times = data['times'].astype(np.float32)
+    durations = data['durations'].astype(np.float32)
+
+    # Angular velocities (axis-angle format)
+    if 'angular_velocities' in data:
+        angular_velocities = data['angular_velocities'].astype(np.float32)
+    else:
+        # Backward compatibility: if not present, initialize to zeros
+        angular_velocities = np.zeros_like(velocities)
+        print("  [Warning] angular_velocities not found in npz, using zeros")
+
+    # Metadata
+    frame_start = int(data.get('frame_start', 0))
+    frame_end = int(data.get('frame_end', 100))
+    frame_step = int(data.get('frame_step', 10))
+    window_size = int(data.get('window_size', 3))
+    window_stride = int(data.get('window_stride', 2))
+    k_neighbors = int(data.get('k_neighbors', 8))
+
+    print(f"  Frame range: [{frame_start}, {frame_end}) step={frame_step}")
+    print(f"  Window size: {window_size}, stride: {window_stride}")
+
+    N = len(positions)
+    print(f"  Loaded {N} points")
+
+    # ==========================================================================
+    # SAMPLING (if max_samples > 0)
+    # ==========================================================================
+    if max_samples > 0 and N > max_samples:
+        print(f"\n  [Sampling] Reducing {N:,} points to {max_samples:,}")
+
+        # Filter by frame range
+        time_min = (sample_frame_start - frame_start) / max(frame_end - frame_start - 1, 1)
+        time_max = (sample_frame_end - frame_start) / max(frame_end - frame_start - 1, 1)
+        time_min, time_max = max(0, time_min), min(1, time_max)
+
+        times_flat = times.flatten()
+        time_mask = (times_flat >= time_min - 0.01) & (times_flat <= time_max + 0.01)
+
+        if time_mask.sum() == 0:
+            print(f"    Warning: No points in frame range [{sample_frame_start}, {sample_frame_end}), using all")
+            time_mask = np.ones(N, dtype=bool)
+
+        # Get unique times in range
+        unique_times = np.unique(times_flat[time_mask])
+        actual_n_times = min(n_times, len(unique_times))
+
+        # Select which times to sample from
+        if actual_n_times == len(unique_times):
+            selected_times = unique_times
+        else:
+            time_indices = np.linspace(0, len(unique_times)-1, actual_n_times, dtype=int)
+            selected_times = unique_times[time_indices]
+
+        print(f"    Sampling from {actual_n_times} times: {selected_times.round(3)}")
+
+        # Budget per time
+        samples_per_time = max_samples // actual_n_times
+        high_vel_per_time = int(samples_per_time * high_velocity_ratio)
+        spatial_per_time = samples_per_time - high_vel_per_time
+
+        # Compute velocity magnitudes
+        vel_mag = np.linalg.norm(velocities, axis=1)
+
+        all_indices = []
+        for t in selected_times:
+            t_mask = np.abs(times_flat - t) < 0.005
+            t_indices = np.where(t_mask)[0]
+            n_at_time = len(t_indices)
+
+            if n_at_time == 0:
+                continue
+
+            t_vel = vel_mag[t_indices]
+            t_pos = positions[t_indices]
+
+            # High velocity sampling (80%)
+            n_high = min(high_vel_per_time, n_at_time)
+            if n_high > 0:
+                sorted_idx = np.argsort(t_vel)[::-1]
+                n_top = n_high // 2
+                n_weighted = n_high - n_top
+
+                top_indices = t_indices[sorted_idx[:n_top]]
+
+                if n_weighted > 0 and len(sorted_idx) > n_top:
+                    remaining_idx = sorted_idx[n_top:]
+                    remaining_vel = t_vel[remaining_idx]
+                    weights = remaining_vel / (remaining_vel.sum() + 1e-8)
+                    n_weighted = min(n_weighted, len(remaining_idx))
+                    weighted_sample = np.random.choice(remaining_idx, n_weighted, replace=False, p=weights)
+                    weighted_indices = t_indices[weighted_sample]
+                else:
+                    weighted_indices = np.array([], dtype=np.int64)
+
+                all_indices.extend(np.concatenate([top_indices, weighted_indices]).tolist())
+
+            # Spatial coverage sampling (20%)
+            n_spatial = min(spatial_per_time, n_at_time)
+            if n_spatial > 0:
+                pos_min, pos_max = t_pos.min(axis=0), t_pos.max(axis=0)
+                pos_range = pos_max - pos_min + 1e-6
+                grid_coords = ((t_pos - pos_min) / pos_range * grid_resolution).astype(int)
+                grid_coords = np.clip(grid_coords, 0, grid_resolution - 1)
+                cell_ids = (grid_coords[:, 0] * grid_resolution * grid_resolution +
+                           grid_coords[:, 1] * grid_resolution + grid_coords[:, 2])
+
+                unique_cells = np.unique(cell_ids)
+                samples_per_cell = max(1, n_spatial // len(unique_cells))
+                spatial_indices = []
+
+                for cell in unique_cells:
+                    cell_point_indices = np.where(cell_ids == cell)[0]
+                    n_from_cell = min(samples_per_cell, len(cell_point_indices))
+                    if n_from_cell > 0:
+                        sampled = np.random.choice(cell_point_indices, n_from_cell, replace=False)
+                        spatial_indices.extend(t_indices[sampled].tolist())
+                    if len(spatial_indices) >= n_spatial:
+                        break
+
+                all_indices.extend(spatial_indices[:n_spatial])
+
+        # Remove duplicates and apply
+        all_indices = np.array(list(set(all_indices)), dtype=np.int64)
+        np.random.shuffle(all_indices)
+
+        positions = positions[all_indices]
+        velocities = velocities[all_indices]
+        angular_velocities = angular_velocities[all_indices]
+        colors = colors[all_indices]
+        times = times[all_indices]
+        durations = durations[all_indices]
+
+        N = len(positions)
+        print(f"    Sampled to {N:,} points")
+
+    # Normalize colors to [0, 1] if needed
+    if colors.max() > 1.0:
+        colors = colors / 255.0
+
+    # Cap large linear velocities
+    vel_mag = np.linalg.norm(velocities, axis=1, keepdims=True)
+    large_vel_mask = vel_mag.squeeze() > max_velocity
+    if large_vel_mask.any():
+        vel_scale = np.clip(max_velocity / (vel_mag + 1e-8), a_min=None, a_max=1.0)
+        velocities = velocities * vel_scale
+        n_capped = large_vel_mask.sum()
+        print(f"  Capped {n_capped} linear velocities exceeding {max_velocity}")
+
+    # Cap large angular velocities
+    ang_vel_mag = np.linalg.norm(angular_velocities, axis=1, keepdims=True)
+    large_ang_vel_mask = ang_vel_mag.squeeze() > max_angular_velocity
+    if large_ang_vel_mask.any():
+        ang_vel_scale = np.clip(max_angular_velocity / (ang_vel_mag + 1e-8), a_min=None, a_max=1.0)
+        angular_velocities = angular_velocities * ang_vel_scale
+        n_ang_capped = large_ang_vel_mask.sum()
+        print(f"  Capped {n_ang_capped} angular velocities exceeding {max_angular_velocity}")
+
+    # All points from windowed tracking have velocity
+    has_velocity = np.ones(N, dtype=bool)
+
+    # Apply transform if provided
+    if transform is not None:
+        R = transform[:3, :3]
+        t = transform[:3, 3]
+        positions = (positions @ R.T) + t
+        velocities = velocities @ R.T
+        # Angular velocities also need rotation (but not translation)
+        angular_velocities = angular_velocities @ R.T
+
+    # Ensure times shape is [N, 1]
+    if times.ndim == 1:
+        times = times.reshape(-1, 1)
+
+    result = {
+        'positions': torch.from_numpy(positions).float(),
+        'times': torch.from_numpy(times).float(),
+        'velocities': torch.from_numpy(velocities).float(),
+        'angular_velocities': torch.from_numpy(angular_velocities).float(),
+        'colors': torch.from_numpy(colors).float(),
+        'has_velocity': torch.from_numpy(has_velocity).bool(),
+        'durations': torch.from_numpy(durations).float(),  # Extra: window duration per point
+    }
+
+    print(f"\n[WindowedPoints] Final: {N} points")
+    print(f"  Time range: [{result['times'].min():.3f}, {result['times'].max():.3f}]")
+    print(f"  Duration range: [{result['durations'].min():.3f}, {result['durations'].max():.3f}]")
+    print(f"  With velocity: {N} (100.0%)")
+
+    vel_mags = result['velocities'].norm(dim=1)
+    print(f"  Linear velocity magnitude: "
+          f"min={vel_mags.min():.4f}, "
+          f"max={vel_mags.max():.4f}, "
+          f"mean={vel_mags.mean():.4f}")
+
+    ang_vel_mags = result['angular_velocities'].norm(dim=1)
+    non_zero_ang = (ang_vel_mags > 1e-8).sum()
+    print(f"  Angular velocity magnitude: "
+          f"min={ang_vel_mags.min():.4f}, "
+          f"max={ang_vel_mags.max():.4f}, "
+          f"mean={ang_vel_mags.mean():.4f}, "
+          f"non-zero={non_zero_ang}/{N} ({100*non_zero_ang/N:.1f}%)")
 
     return result
 
