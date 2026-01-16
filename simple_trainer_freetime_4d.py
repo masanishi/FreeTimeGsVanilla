@@ -475,6 +475,56 @@ class Config:
     prune_opacity_threshold: float = 0.005
     """Prune Gaussians with opacity below this threshold."""
 
+    # ==================== Motion-Aware Loss ====================
+    use_motion_weighted_loss: bool = True
+    """Enable difficulty-weighted photometric loss. Regions with high velocity
+    and low duration (fast-moving, short-lived) get higher loss weight."""
+
+    motion_weight_velocity: float = 0.45
+    """Weight for velocity magnitude in difficulty score (0-1).
+    Higher = more emphasis on high-velocity regions."""
+
+    motion_weight_duration: float = 0.55
+    """Weight for inverse duration in difficulty score (0-1).
+    Higher = more emphasis on short-duration (transient) regions."""
+
+    motion_weight_max: float = 3.0
+    """Maximum difficulty weight multiplier. Prevents extreme weights
+    that could destabilize training. Range: [1, motion_weight_max]."""
+
+    motion_weight_start_iter: int = 3000
+    """Start applying motion-weighted loss after this iteration.
+    Should be after canonical phase when velocities are being learned."""
+
+    # ==================== Temporal Coverage Densification ====================
+    use_temporal_densification: bool = True
+    """Enable temporal coverage densification. Spawns new Gaussians in regions
+    where temporal coverage is poor (high velocity + low duration)."""
+
+    temporal_densify_every: int = 500
+    """Check for temporal coverage gaps every N iterations."""
+
+    temporal_densify_start_iter: int = 5000
+    """Start temporal densification after this iteration."""
+
+    temporal_densify_stop_iter: int = 40000
+    """Stop temporal densification after this iteration."""
+
+    temporal_densify_velocity_threshold: float = 0.1
+    """Velocity magnitude threshold for identifying fast-moving Gaussians.
+    Gaussians with velocity > threshold are candidates for temporal spawning."""
+
+    temporal_densify_duration_threshold: float = 0.15
+    """Duration threshold for identifying short-lived Gaussians.
+    Gaussians with duration < threshold are candidates for temporal spawning."""
+
+    temporal_densify_max_spawn: int = 5000
+    """Maximum number of new Gaussians to spawn per densification step."""
+
+    temporal_densify_opacity_threshold: float = 0.3
+    """Only consider Gaussians with opacity above this for temporal spawning.
+    Prevents spawning from already-faint Gaussians."""
+
     # ==================== Rendering ====================
     near_plane: float = 0.01
     """Near clipping plane for rendering."""
@@ -1195,6 +1245,240 @@ class FreeTime4DRunner:
         reg = (base_opacity * temporal_opa_sg).mean()
         return reg
 
+    def compute_difficulty_scores(self) -> Tensor:
+        """
+        Compute per-Gaussian difficulty scores based on velocity and duration.
+
+        Difficulty = α * normalized_velocity + β * normalized_inverse_duration
+
+        High velocity + low duration = high difficulty (fast-moving, short-lived regions)
+        These regions need more attention during training.
+
+        Returns:
+            difficulty: [N] tensor of difficulty scores in range [1, motion_weight_max]
+        """
+        cfg = self.cfg
+        with torch.no_grad():
+            # Velocity magnitude
+            velocities = self.splats["velocities"]  # [N, 3]
+            velocity_mag = torch.norm(velocities, dim=-1)  # [N]
+
+            # Duration (original space)
+            durations = torch.exp(self.splats["durations"]).squeeze(-1)  # [N]
+
+            # Inverse duration (higher for short-lived Gaussians)
+            inv_duration = 1.0 / (durations + 1e-6)
+
+            # Normalize to [0, 1] range using percentiles to handle outliers
+            vel_min = velocity_mag.min()
+            vel_max = velocity_mag.quantile(0.95).clamp(min=vel_min + 1e-6)
+            velocity_norm = ((velocity_mag - vel_min) / (vel_max - vel_min + 1e-6)).clamp(0, 1)
+
+            inv_dur_min = inv_duration.min()
+            inv_dur_max = inv_duration.quantile(0.95).clamp(min=inv_dur_min + 1e-6)
+            inv_duration_norm = ((inv_duration - inv_dur_min) / (inv_dur_max - inv_dur_min + 1e-6)).clamp(0, 1)
+
+            # Combined difficulty score
+            difficulty_raw = (
+                cfg.motion_weight_velocity * velocity_norm +
+                cfg.motion_weight_duration * inv_duration_norm
+            )
+
+            # Scale to [1, motion_weight_max] range
+            difficulty = 1.0 + difficulty_raw * (cfg.motion_weight_max - 1.0)
+
+        return difficulty
+
+    def render_difficulty_map(
+        self,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        t: float,
+        difficulty: Tensor,
+        static_mode: bool = False,
+        use_temporal_opacity: bool = True,
+    ) -> Tensor:
+        """
+        Render a per-pixel difficulty map by rasterizing Gaussian difficulty scores.
+
+        Args:
+            difficulty: [N] per-Gaussian difficulty scores
+
+        Returns:
+            difficulty_map: [B, H, W, 1] per-pixel difficulty weights
+        """
+        # Position: apply velocity during 4D phase
+        if static_mode:
+            means = self.splats["means"]
+        else:
+            means = self.compute_positions_at_time(t)
+
+        # Temporal opacity: skip during warmup
+        if use_temporal_opacity:
+            temporal_opacity = self.compute_temporal_opacity(t)
+        else:
+            temporal_opacity = torch.ones(len(means), device=self.device)
+
+        quats = self.splats["quats"]
+        scales = torch.exp(self.splats["scales"])
+        base_opacity = torch.sigmoid(self.splats["opacities"])
+        opacities = base_opacity * temporal_opacity
+        opacities = torch.clamp(opacities, min=1e-4)
+
+        # Use difficulty as the "color" for rasterization
+        difficulty_colors = difficulty.unsqueeze(-1).expand(-1, 3)  # [N, 3]
+
+        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        difficulty_render, _, _ = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=difficulty_colors,  # [N, 3] difficulty as color
+            viewmats=torch.linalg.inv(camtoworlds),
+            Ks=Ks,
+            width=width,
+            height=height,
+            packed=self.cfg.packed,
+            sh_degree=None,  # No SH, direct color
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            rasterize_mode=rasterize_mode,
+        )
+
+        # Take one channel (all 3 are the same)
+        difficulty_map = difficulty_render[..., :1]  # [B, H, W, 1]
+
+        # Normalize: background pixels get weight 1.0
+        # difficulty_map is 0 where no Gaussians rendered
+        difficulty_map = torch.where(
+            difficulty_map < 0.5,  # Background (no Gaussians)
+            torch.ones_like(difficulty_map),
+            difficulty_map
+        )
+
+        return difficulty_map
+
+    def temporal_coverage_densification(self, step: int) -> int:
+        """
+        Temporal coverage densification: spawn new Gaussians in regions where
+        temporal coverage is poor (high velocity + low duration).
+
+        The idea:
+        1. Find Gaussians with high velocity and low duration
+        2. These Gaussians "disappear" at certain times, leaving gaps
+        3. Spawn new Gaussians at adjacent time points to fill gaps
+
+        Returns:
+            Number of new Gaussians spawned
+        """
+        cfg = self.cfg
+
+        with torch.no_grad():
+            velocities = self.splats["velocities"]  # [N, 3]
+            durations = torch.exp(self.splats["durations"]).squeeze(-1)  # [N]
+            times = self.splats["times"].squeeze(-1)  # [N]
+            base_opacity = torch.sigmoid(self.splats["opacities"])  # [N]
+            velocity_mag = torch.norm(velocities, dim=-1)  # [N]
+
+            # Find candidates: high velocity, low duration, decent opacity
+            candidate_mask = (
+                (velocity_mag > cfg.temporal_densify_velocity_threshold) &
+                (durations < cfg.temporal_densify_duration_threshold) &
+                (base_opacity > cfg.temporal_densify_opacity_threshold)
+            )
+
+            n_candidates = candidate_mask.sum().item()
+            if n_candidates == 0:
+                return 0
+
+            # Limit number of spawns
+            n_spawn = min(n_candidates, cfg.temporal_densify_max_spawn)
+
+            # Score candidates by velocity * inverse_duration (higher = more important)
+            candidate_idx = candidate_mask.nonzero(as_tuple=True)[0]
+            scores = velocity_mag[candidate_idx] / (durations[candidate_idx] + 1e-6)
+
+            # Select top candidates
+            if len(candidate_idx) > n_spawn:
+                _, top_indices = scores.topk(n_spawn)
+                selected_idx = candidate_idx[top_indices]
+            else:
+                selected_idx = candidate_idx
+
+            n_to_spawn = len(selected_idx)
+            if n_to_spawn == 0:
+                return 0
+
+            # For each selected Gaussian, spawn a new one at a nearby time
+            # Strategy: spawn at time = original_time ± duration (fill the gap)
+            spawn_direction = torch.sign(torch.randn(n_to_spawn, device=self.device))
+            time_offset = durations[selected_idx] * spawn_direction * 1.5  # Spawn 1.5 durations away
+
+            new_times = (times[selected_idx] + time_offset).clamp(0, 1)
+
+            # Compute positions at the new times (using velocity)
+            new_means = (
+                self.splats["means"][selected_idx] +
+                self.splats["velocities"][selected_idx] * (new_times - times[selected_idx]).unsqueeze(-1)
+            )
+
+            # Copy other parameters from parent Gaussians
+            new_quats = self.splats["quats"][selected_idx].clone()
+            new_scales = self.splats["scales"][selected_idx].clone()
+            new_opacities = self.splats["opacities"][selected_idx].clone()
+            new_sh0 = self.splats["sh0"][selected_idx].clone()
+            new_shN = self.splats["shN"][selected_idx].clone()
+
+            # New Gaussians get fresh duration (inherit from parent but reset)
+            new_durations = self.splats["durations"][selected_idx].clone()
+
+            # New Gaussians get reduced velocity (they're filling gaps, not moving as fast)
+            new_velocities = self.splats["velocities"][selected_idx].clone() * 0.5
+
+        # Concatenate new Gaussians to existing parameters using _update_param_with_optimizer
+        # This properly handles optimizer state extension
+        param_names = ["means", "quats", "scales", "opacities", "sh0", "shN", "times", "durations", "velocities"]
+        new_values_dict = {
+            "means": new_means,
+            "quats": new_quats,
+            "scales": new_scales,
+            "opacities": new_opacities,
+            "sh0": new_sh0,
+            "shN": new_shN,
+            "times": new_times.unsqueeze(-1),
+            "durations": new_durations,
+            "velocities": new_velocities,
+        }
+
+        for name in param_names:
+            old_param = self.splats[name]
+            new_values = new_values_dict[name]
+            new_param = torch.cat([old_param.data, new_values], dim=0)
+
+            # Use the gsplat helper to update param and optimizer state
+            _update_param_with_optimizer(
+                param_fn=lambda p, n=new_param: n,
+                optimizer=self.optimizers[name],
+                param=old_param,
+                name=name,
+            )
+            self.splats[name] = self.optimizers[name].param_groups[0]["params"][0]
+
+        # Reinitialize strategy state (the strategy tracks per-Gaussian info)
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state(scene_scale=self.scene_scale)
+        elif isinstance(self.cfg.strategy, MCMCStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state()
+
+        # Resize gradient accumulator
+        self.grad_accum = torch.zeros(len(self.splats["means"]), device=self.device)
+        self.grad_count = 0
+
+        return n_to_spawn
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -1525,8 +1809,40 @@ class FreeTime4DRunner:
             colors_p = colors.permute(0, 3, 1, 2)  # [B, 3, H, W]
             pixels_p = pixels.permute(0, 3, 1, 2)  # [B, 3, H, W]
 
-            # 1. L1 Loss (reconstruction)
-            l1_loss = F.l1_loss(colors, pixels)
+            # ============================================================
+            # Motion-Weighted Loss: Weight loss higher for difficult regions
+            # (high velocity + low duration = fast-moving, transient regions)
+            # ============================================================
+            use_motion_weight = (
+                cfg.use_motion_weighted_loss and
+                in_4d and
+                step >= cfg.motion_weight_start_iter
+            )
+
+            if use_motion_weight:
+                # Compute per-Gaussian difficulty scores
+                difficulty = self.compute_difficulty_scores()
+
+                # Render difficulty map (per-pixel weights)
+                difficulty_map = self.render_difficulty_map(
+                    camtoworlds, Ks, width, height, t, difficulty,
+                    static_mode=static_mode, use_temporal_opacity=use_temporal_opacity,
+                )  # [B, H, W, 1]
+
+                # Expand to match color channels
+                weight_map = difficulty_map.expand(-1, -1, -1, 3)  # [B, H, W, 3]
+                weight_map_p = weight_map.permute(0, 3, 1, 2)  # [B, 3, H, W]
+            else:
+                weight_map = None
+                weight_map_p = None
+
+            # 1. L1 Loss (reconstruction) - optionally weighted
+            if use_motion_weight and weight_map is not None:
+                # Per-pixel weighted L1 loss
+                l1_per_pixel = torch.abs(colors - pixels)  # [B, H, W, 3]
+                l1_loss = (l1_per_pixel * weight_map).mean() / weight_map.mean()
+            else:
+                l1_loss = F.l1_loss(colors, pixels)
 
             # 2. SSIM Loss (structural similarity)
             ssim_val = fused_ssim(colors_p, pixels_p, padding="valid")
@@ -1622,10 +1938,20 @@ class FreeTime4DRunner:
                         if n_relocated > 0:
                             print(f"[Relocation] Step {step}: relocated {n_relocated}")
 
+            # Temporal coverage densification: spawn new Gaussians in
+            # regions with high velocity + low duration (poor temporal coverage)
+            if cfg.use_temporal_densification and in_4d:
+                if cfg.temporal_densify_start_iter <= step < cfg.temporal_densify_stop_iter:
+                    if step % cfg.temporal_densify_every == 0:
+                        n_spawned = self.temporal_coverage_densification(step)
+                        if n_spawned > 0:
+                            print(f"[TemporalDensify] Step {step}: spawned {n_spawned} new Gaussians for temporal coverage")
+
             # Progress bar
             phase = "WARM" if in_warmup else ("CANON" if in_canonical else "4D")
+            motion_marker = "+MW" if use_motion_weight else ""
             pbar.set_description(
-                f"[{phase}] loss={loss.item():.4f} l1={l1_loss.item():.4f} "
+                f"[{phase}{motion_marker}] loss={loss.item():.4f} l1={l1_loss.item():.4f} "
                 f"t={t:.2f} N={len(self.splats['means'])}"
             )
 
@@ -1687,6 +2013,19 @@ class FreeTime4DRunner:
                     self.writer.add_scalar("temporal/velocity_mean", vel_mag.mean().item(), step)
                     self.writer.add_scalar("temporal/velocity_max", vel_mag.max().item(), step)
                     self.writer.add_scalar("temporal/velocity_min", vel_mag.min().item(), step)
+
+                # --- Motion-Weighted Loss Statistics ---
+                if use_motion_weight:
+                    difficulty = self.compute_difficulty_scores()
+                    self.writer.add_scalar("motion_weight/difficulty_mean", difficulty.mean().item(), step)
+                    self.writer.add_scalar("motion_weight/difficulty_max", difficulty.max().item(), step)
+                    self.writer.add_scalar("motion_weight/difficulty_min", difficulty.min().item(), step)
+                    # Count high-difficulty Gaussians (> 2x weight)
+                    n_high_difficulty = (difficulty > 2.0).sum().item()
+                    self.writer.add_scalar("motion_weight/n_high_difficulty", n_high_difficulty, step)
+                    self.writer.add_scalar("motion_weight/enabled", 1.0, step)
+                else:
+                    self.writer.add_scalar("motion_weight/enabled", 0.0, step)
 
                 # --- Training Info ---
                 self.writer.add_scalar("train/time_t", t, step)
