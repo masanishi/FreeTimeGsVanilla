@@ -6,13 +6,12 @@ build-backend = "setuptools.build_meta"
 py-modules = []
 
 [project]
-name = "freetimegsroma"
+name = "freetimegs"
 version = "0.1.0"
-description = "My project using RoMaV2"
+description = "4D Gaussian Splatting training pipeline"
 requires-python = ">=3.12"
 dependencies = [
     "torch",
-    "romav2",
     "pycolmap",
     "viser",
     "nerfview==0.0.2",
@@ -41,7 +40,6 @@ dependencies = [
 override-dependencies = ["pandas>=2.2"]
 
 [tool.uv.sources]
-romav2 = { path = "RoMaV2", editable = true }
 pycolmap = { git = "https://github.com/JasonLSC/pycolmap.git" }
 fused-ssim = { git = "https://github.com/rahul-goel/fused-ssim", rev = "1272e21a282342e89537159e4bad508b19b34157" }
 plas = { git = "https://github.com/fraunhoferhhi/PLAS.git" }
