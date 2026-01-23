@@ -1,34 +1,75 @@
-# FreeTimeGS - 4D Gaussian Splatting
+<div align="center">
+
+# FreeTimeGS
+
+### Gsplat-based 4D Gaussian Splatting for Dynamic Scenes
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![CVPR 2025](https://img.shields.io/badge/CVPR-2025-green.svg)](https://cvpr.thecvf.com/)
 
-A [gsplat](https://github.com/nerfstudio-project/gsplat)-based implementation of **FreeTimeGS** for dynamic scene reconstruction.
+</div>
 
-> **FreeTimeGS: Free Gaussian Primitives at Anytime Anywhere for Dynamic Scene Reconstruction**
+---
+
+A high-performance implementation of **FreeTimeGS** built on [gsplat](https://github.com/nerfstudio-project/gsplat) for reconstructing dynamic scenes from multi-view video.
+
+<table>
+<tr>
+<td width="60%">
+
+**Key Features**
+
+- **4D Gaussian Primitives** - Each Gaussian has position, velocity, time, and duration
+- **Temporal Motion Model** - `x(t) = x + v * (t - t_canonical)`
+- **gsplat Backend** - Efficient CUDA kernels for fast rendering
+- **Flexible Optimization** - MCMC and DefaultStrategy densification
+- **Keyframe Processing** - Smart sampling for large video sequences
+
+</td>
+<td width="40%">
+
+**Based on the paper:**
+
+> *FreeTimeGS: Free Gaussian Primitives at Anytime Anywhere for Dynamic Scene Reconstruction*
+>
 > Yifan Wang, Peishan Yang, Zhen Xu, Jiaming Sun, Zhanhua Zhang, Yong Chen, Hujun Bao, Sida Peng, Xiaowei Zhou
-> CVPR 2025
-> [[Paper]](https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_FreeTimeGS_Free_Gaussian_Primitives_at_Anytime_Anywhere_for_Dynamic_Scene_CVPR_2025_paper.pdf) [[Project Page]](https://zju3dv.github.io/freetimegs/)
+>
+> **CVPR 2025**
 
-This implementation leverages gsplat's efficient CUDA kernels for Gaussian splatting rendering and optimization strategies (MCMC, DefaultStrategy) to train 4D Gaussians with temporal parameters (position, velocity, time, duration).
+[[Paper]](https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_FreeTimeGS_Free_Gaussian_Primitives_at_Anytime_Anywhere_for_Dynamic_Scene_CVPR_2025_paper.pdf) [[Project Page]](https://zju3dv.github.io/freetimegs/)
+
+</td>
+</tr>
+</table>
+
+---
 
 
 ## Repository Structure
 
 ```
 FreeTimeGsVanilla/
-├── src/
-│   ├── simple_trainer_freetime_4d_pure_relocation.py  # Main 4D GS trainer
-│   └── combine_frames_fast_keyframes.py               # Keyframe point cloud combiner
-├── datasets/
-│   ├── __init__.py              # Package exports
-│   ├── FreeTime_dataset.py      # Dataset loading (COLMAP poses, images)
-│   ├── normalize.py             # Scene normalization utilities
-│   ├── traj.py                  # Camera trajectory generation
-│   └── read_write_model.py      # COLMAP binary/text I/O
-├── utils.py                     # Utility functions
-├── run_pipeline.sh              # Full pipeline script
-├── run_small.sh                 # Small config training
-└── run_full.sh                  # Full config training
+│
+├── src/                          # Core source code
+│   ├── simple_trainer_freetime_4d_pure_relocation.py   # Main 4D GS trainer
+│   ├── combine_frames_fast_keyframes.py                # Keyframe point cloud combiner
+│   └── utils.py                                        # Utility functions (KNN, colormap, etc.)
+│
+├── datasets/                     # Data loading & processing
+│   ├── __init__.py               # Package exports
+│   ├── FreeTime_dataset.py       # Dataset class (COLMAP poses, images)
+│   ├── normalize.py              # Scene normalization utilities
+│   ├── traj.py                   # Camera trajectory generation
+│   └── read_write_model.py       # COLMAP binary/text I/O
+│
+├── run_pipeline.sh               # Full pipeline (combine + train)
+├── run_small.sh                  # Quick training (4M points)
+├── run_full.sh                   # Full training (15M points)
+│
+├── LICENSE                       # AGPL-3.0 license
+└── README.md                     # This file
 ```
 
 ## Pipeline Overview

@@ -170,8 +170,10 @@ from gsplat.optimizers import SelectiveAdam
 from gsplat.exporter import export_splats
 
 import sys
-# Add parent directory to path for imports when running from src/
+# Add parent directory to path for datasets imports
+# Add current directory (src/) to path for local imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.FreeTime_dataset import FreeTimeParser, FreeTimeDataset, skip_none_collate
 from utils import knn, rgb_to_sh, set_random_seed
