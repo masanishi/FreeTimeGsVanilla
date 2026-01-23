@@ -3,6 +3,8 @@
 
 ### Gsplat-based 4D Gaussian Splatting for Dynamic Scenes
 
+<img src="assets/demo.gif" width="100%" alt="FreeTimeGS Demo">
+
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -34,6 +36,7 @@ FreeTimeGsVanilla/
 ├── src/                          # Core source code
 │   ├── simple_trainer_freetime_4d_pure_relocation.py   # Main 4D GS trainer
 │   ├── combine_frames_fast_keyframes.py                # Keyframe point cloud combiner
+│   ├── viewer_4d.py                                    # Interactive 4D Gaussian viewer
 │   └── utils.py                                        # Utility functions (KNN, colormap, etc.)
 │
 ├── datasets/                     # Data loading & processing
@@ -236,6 +239,196 @@ results/
 │   ├── frame_000000.ply           # Per-frame PLY exports
 │   └── ...
 └── tb/                            # TensorBoard logs
+```
+
+## 4D Viewer
+
+An interactive viewer for visualizing trained 4D Gaussian Splatting models with temporal animation.
+
+### Installation
+
+The viewer requires additional dependencies:
+
+```bash
+# Core dependencies
+pip install torch torchvision  # PyTorch 2.0+
+
+# Gaussian splatting backend
+pip install gsplat  # or: pip install git+https://github.com/nerfstudio-project/gsplat.git
+
+# Viewer dependencies
+pip install viser nerfview numpy
+```
+
+**Verify installation:**
+```bash
+python -c "import viser; import nerfview; import gsplat; print('All dependencies installed!')"
+```
+
+### Quick Start
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python src/viewer_4d.py \
+    --ckpt /path/to/results/ckpts/ckpt_30000.pt \
+    --port 8080 \
+    --total-frames 60 \
+    --temporal-threshold 0.05 \
+    --spatial-percentile 95
+```
+
+Then open `http://localhost:8080` in your browser.
+
+### Checkpoint File Format (.pt)
+
+The checkpoint file contains all trained 4D Gaussian parameters:
+
+```python
+checkpoint = {
+    "splats": {
+        "means": tensor[N, 3],       # Canonical 3D positions
+        "scales": tensor[N, 3],      # Log-scale parameters
+        "quats": tensor[N, 4],       # Rotation quaternions (wxyz)
+        "opacities": tensor[N],      # Logit opacities
+        "sh0": tensor[N, 1, 3],      # DC spherical harmonics
+        "shN": tensor[N, K, 3],      # Higher-order SH coefficients
+        # 4D temporal parameters:
+        "times": tensor[N, 1],       # Canonical time (when Gaussian is most visible)
+        "durations": tensor[N, 1],   # Log temporal duration (visibility window width)
+        "velocities": tensor[N, 3],  # Linear velocity vectors
+    },
+    "step": int,                     # Training step
+    ...
+}
+```
+
+### Command Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--ckpt` | **required** | Path to trained checkpoint `.pt` file |
+| `--port` | 8080 | HTTP port for the viewer |
+| `--device` | cuda | Device to use (cuda, cuda:0, cuda:1, etc.) |
+| `--total-frames` | 300 | Total number of frames in the sequence |
+| `--temporal-threshold` | 0.01 | Minimum temporal opacity to render a Gaussian |
+| `--spatial-percentile` | 95 | Percentile of points to keep (removes outliers) |
+| `--no-spatial-filter` | False | Disable spatial filtering |
+| `--no-precompute` | False | Disable precomputing visibility masks |
+| `--sh-degree` | 3 | Spherical harmonics degree |
+
+### Understanding Key Parameters
+
+#### `--temporal-threshold`
+
+Controls which Gaussians are rendered at each frame based on their temporal opacity.
+
+Each Gaussian has a temporal opacity computed as:
+```
+temporal_opacity(t) = exp(-0.5 * ((t - t_canonical) / duration)^2)
+```
+
+- **Lower threshold (0.01)**: More Gaussians visible, smoother but slower
+- **Higher threshold (0.1)**: Fewer Gaussians, faster but may show gaps
+
+```
+Temporal opacity vs time for a Gaussian centered at t=0.5:
+
+    1.0 |       ****
+        |      *    *
+    0.5 |     *      *
+        |    *        *
+  0.05 -|---*----------*--- threshold
+        |  *            *
+    0.0 +-------------------> time
+        0.0    0.5    1.0
+              ^
+          Gaussian visible when opacity > threshold
+```
+
+#### `--spatial-percentile`
+
+Removes outlier Gaussians that are far from the scene center.
+
+- **95%**: Keep Gaussians within the 95th percentile distance from center (removes 5% outliers)
+- **99%**: Keep more Gaussians (removes only 1% outliers)
+- **100%**: Keep all Gaussians (no spatial filtering)
+
+This is useful when training produces "floater" artifacts far from the main scene.
+
+```
+Example with 5M Gaussians:
+┌─────────────────────────────────────┐
+│  · ·                            · · │  <- outliers (removed)
+│      ┌───────────────────────┐      │
+│      │  * * * * * * * * * *  │      │  <- 95% kept
+│      │  * * * SCENE * * * *  │      │
+│      │  * * * * * * * * * *  │      │
+│      └───────────────────────┘      │
+│  ·                              ·   │  <- outliers (removed)
+└─────────────────────────────────────┘
+```
+
+### Viewer UI Controls
+
+Once the viewer is running, you can control it through the web interface:
+
+**Animation Panel:**
+- **Frame Slider**: Manually scrub through time
+- **Auto Play**: Toggle automatic playback
+- **Play Speed (FPS)**: Control playback speed (1-60 FPS)
+
+**Visibility Filtering Panel:**
+- **Temporal Opacity Threshold**: Adjust visibility threshold in real-time
+- **Use Visibility Mask**: Toggle efficient rendering on/off
+
+**Camera Controls (in browser):**
+- Left-click + drag: Rotate camera
+- Right-click + drag: Pan camera
+- Scroll: Zoom in/out
+
+### Efficiency: Visibility Masking
+
+The viewer uses multi-level filtering for efficient rendering:
+
+| Filter Stage | Purpose | Typical Reduction |
+|--------------|---------|-------------------|
+| Spatial filter | Remove outliers | 100% → 96% |
+| Base opacity filter | Remove transparent Gaussians | 96% → 95% |
+| Temporal filter | Only render temporally-visible | 95% → **8%** |
+
+**Result**: Only ~8% of Gaussians are rendered per frame, enabling interactive framerates with millions of Gaussians.
+
+### Example Usage
+
+**Basic viewing:**
+```bash
+python src/viewer_4d.py --ckpt results/ckpts/ckpt_30000.pt --total-frames 60
+```
+
+**High-quality (show more Gaussians):**
+```bash
+python src/viewer_4d.py \
+    --ckpt results/ckpts/ckpt_30000.pt \
+    --total-frames 60 \
+    --temporal-threshold 0.01 \
+    --spatial-percentile 99
+```
+
+**Fast preview (fewer Gaussians):**
+```bash
+python src/viewer_4d.py \
+    --ckpt results/ckpts/ckpt_30000.pt \
+    --total-frames 60 \
+    --temporal-threshold 0.1 \
+    --spatial-percentile 90
+```
+
+**Debug mode (no filtering):**
+```bash
+python src/viewer_4d.py \
+    --ckpt results/ckpts/ckpt_30000.pt \
+    --total-frames 60 \
+    --no-spatial-filter \
+    --temporal-threshold 0.0
 ```
 
 ## Key Parameters
