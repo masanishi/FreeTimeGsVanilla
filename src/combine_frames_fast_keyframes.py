@@ -23,14 +23,14 @@ Smart Sampling (--use-smart-sampling):
 
 Usage:
     # Basic (no sampling)
-    python combine_frames_fast_keyframes.py \\
+    python src/combine_frames_fast_keyframes.py \\
         --input-dir /path/to/triangulation/output \\
         --output-path /path/to/keyframes_with_velocity.npz \\
         --frame-start 0 --frame-end 299 \\
         --keyframe-step 5
 
     # With smart sampling (recommended for large datasets)
-    python combine_frames_fast_keyframes.py \\
+    python src/combine_frames_fast_keyframes.py \\
         --input-dir /path/to/triangulation/output \\
         --output-path /path/to/keyframes_smart_6M.npz \\
         --frame-start 0 --frame-end 299 \\

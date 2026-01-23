@@ -7,14 +7,14 @@ A complete implementation of 4D Gaussian Splatting for dynamic scene reconstruct
 ```
 FreeTimeGsVanilla/
 ├── src/
-│   └── simple_trainer_freetime_4d_pure_relocation.py  # Main 4D GS trainer
+│   ├── simple_trainer_freetime_4d_pure_relocation.py  # Main 4D GS trainer
+│   └── combine_frames_fast_keyframes.py               # Keyframe point cloud combiner
 ├── datasets/
 │   ├── __init__.py              # Package exports
 │   ├── FreeTime_dataset.py      # Dataset loading (COLMAP poses, images)
 │   ├── normalize.py             # Scene normalization utilities
 │   ├── traj.py                  # Camera trajectory generation
 │   └── read_write_model.py      # COLMAP binary/text I/O
-├── combine_frames_fast_keyframes.py  # Keyframe point cloud combiner
 ├── utils.py                     # Utility functions
 ├── run_pipeline.sh              # Full pipeline script
 ├── run_small.sh                 # Small config training
@@ -25,7 +25,7 @@ FreeTimeGsVanilla/
 
 The training pipeline consists of two main steps:
 
-1. **Point Cloud Preparation** (`combine_frames_fast_keyframes.py`):
+1. **Point Cloud Preparation** (`src/combine_frames_fast_keyframes.py`):
    - Loads per-frame triangulated 3D points
    - Extracts keyframes at specified intervals
    - Estimates velocity using k-NN matching between consecutive keyframes
@@ -112,7 +112,7 @@ np.savez(
 
 ### Per-Frame Point Cloud Files
 
-The `combine_frames_fast_keyframes.py` script expects:
+The `src/combine_frames_fast_keyframes.py` script expects:
 
 ```
 input_dir/
@@ -163,7 +163,7 @@ bash run_pipeline.sh \
 **Step 1: Combine keyframes**
 
 ```bash
-python combine_frames_fast_keyframes.py \
+python src/combine_frames_fast_keyframes.py \
     --input-dir /path/to/triangulation/output \
     --output-path /path/to/keyframes.npz \
     --frame-start 0 \

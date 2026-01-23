@@ -69,7 +69,7 @@ echo ""
 echo "Step 1: Combining keyframes with velocity..."
 echo "========================================"
 
-python combine_frames_fast_keyframes.py \
+python src/combine_frames_fast_keyframes.py \
     --input-dir "$INPUT_DIR" \
     --output-path "$NPZ_PATH" \
     --frame-start "$START_FRAME" \
