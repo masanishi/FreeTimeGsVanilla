@@ -2,6 +2,8 @@
 
 A complete implementation of 4D Gaussian Splatting for dynamic scene reconstruction.
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 ## Repository Structure
 
 ```
@@ -252,3 +254,7 @@ Temporal opacity (Gaussian falloff):
 ```
 opacity(t) = exp(-0.5 * ((t - t_canonical) / duration)^2)
 ```
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
