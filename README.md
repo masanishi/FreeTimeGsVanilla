@@ -7,7 +7,7 @@ A [gsplat](https://github.com/nerfstudio-project/gsplat)-based implementation of
 > **FreeTimeGS: Free Gaussian Primitives at Anytime Anywhere for Dynamic Scene Reconstruction**
 > Yifan Wang, Peishan Yang, Zhen Xu, Jiaming Sun, Zhanhua Zhang, Yong Chen, Hujun Bao, Sida Peng, Xiaowei Zhou
 > CVPR 2025
-> [[Paper]](https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_FreeTimeGS_Free_Gaussian_Primitives_at_Anytime_Anywhere_for_Dynamic_Scene_CVPR_2025_paper.pdf) [[Project Page]](https://freetime-gs.github.io/)
+> [[Paper]](https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_FreeTimeGS_Free_Gaussian_Primitives_at_Anytime_Anywhere_for_Dynamic_Scene_CVPR_2025_paper.pdf) [[Project Page]](https://zju3dv.github.io/freetimegs/)
 
 This implementation leverages gsplat's efficient CUDA kernels for Gaussian splatting rendering and optimization strategies (MCMC, DefaultStrategy) to train 4D Gaussians with temporal parameters (position, velocity, time, duration).
 
