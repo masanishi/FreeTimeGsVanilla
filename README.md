@@ -175,6 +175,46 @@ data_dir/
         └── points3D.bin
 ```
 
+### COLMAP Data（同時刻・多視点動画からの作成手順）
+
+同じ時刻を別角度で撮影した複数動画（例: cam01.mp4, cam02.mp4, ...）からCOLMAP Dataを作る際は、
+「フレーム番号 = 同時刻」を厳密に揃えることが最重要です。手順は以下の通りです。
+
+1. **各カメラ動画をフレーム画像に分解**
+    - すべての動画を同じFPSで書き出す
+    - フレーム番号が同時刻に一致するように命名する
+
+2. **`data_dir/images/` に全カメラの画像を集約**
+    - カメラ名 + フレーム番号の規則を維持する
+
+    例（同じ時刻のフレームが揃う命名）:
+    ```
+    data_dir/images/
+    ├── cam01_frame000000.jpg
+    ├── cam02_frame000000.jpg
+    ├── cam01_frame000001.jpg
+    ├── cam02_frame000001.jpg
+    └── ...
+    ```
+
+3. **COLMAPでSparse Reconstructionを作成**
+    - 特徴抽出 → マッチング → 三角測量を行う
+    - 出力が以下の形になることを確認する
+
+    ```
+    data_dir/sparse/0/
+    ├── cameras.bin
+    ├── images.bin
+    └── points3D.bin
+    ```
+
+4. **FreeTimeGSの入力として使用**
+    - `data_dir/images/` と `data_dir/sparse/0/` が揃っていればOK
+
+**注意点**
+- カメラ間でFPSや開始時刻がズレると、同時刻フレームが一致せず再構成が破綻します。
+- フレーム範囲を切る場合、全カメラで同じ開始・終了フレームに揃えてください。
+
 ## Usage
 
 ### Full Pipeline
