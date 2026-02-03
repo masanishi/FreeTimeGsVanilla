@@ -34,6 +34,7 @@ FRAME_END="$4"
 FPS="${5:-30}"
 DOWNSAMPLE="${6:-1}"
 SKIP_EXTRACT="${7:-false}"
+GPU_INDEX="${GPU_INDEX:-0}"
 
 IMAGES_DIR="$DATA_DIR/images"
 SPARSE_DIR="$DATA_DIR/sparse"
@@ -100,11 +101,15 @@ colmap database_creator \
 colmap feature_extractor \
   --database_path "$DB_PATH" \
   --image_path "$IMAGES_DIR" \
-  --ImageReader.single_camera 1
+  --ImageReader.single_camera 1 \
+  --SiftExtraction.use_gpu 1 \
+  --SiftExtraction.gpu_index "$GPU_INDEX"
 
 # 画像マッチング（全画像を総当たり）
 colmap exhaustive_matcher \
-  --database_path "$DB_PATH"
+  --database_path "$DB_PATH" \
+  --SiftMatching.use_gpu 1 \
+  --SiftMatching.gpu_index "$GPU_INDEX"
 
 # 三角測量（Sparse Reconstruction）
 colmap mapper \
