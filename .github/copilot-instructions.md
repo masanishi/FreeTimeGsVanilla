@@ -17,7 +17,6 @@
 
 ## Key scripts & workflows
 - Full pipeline: `run_pipeline.sh` (activates `.venv`, builds NPZ, then trains).
-- Dataset prep: `extract_frames.sh` and `prepare_dataset.sh` (ffmpeg + COLMAP).
 - Example training shortcuts: `run_small.sh` / `run_full.sh` (hardcoded paths; treat as templates).
 
 ## Conventions & patterns

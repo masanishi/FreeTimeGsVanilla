@@ -5,22 +5,25 @@ set -euo pipefail
 # 多視点動画から FreeTimeGS 用の COLMAP データを作るスクリプト
 #
 # 使い方:
-#   ./scripts/prepare_dataset.sh <videos_dir> <data_dir> <frame_start> <frame_end> [fps]
+#   ./scripts/prepare_dataset.sh <videos_dir> <data_dir> <frame_start> <frame_end> [fps] [downsample] [skip_extract]
 #
 # 例:
-#   ./scripts/prepare_dataset.sh ./dance ./dataset 0 3600 30
+#   ./scripts/prepare_dataset.sh ./dance ./dataset 0 60 60 2
+#   ./scripts/prepare_dataset.sh ./dance ./dataset 0 60 60 2 true
+#   ※ downsample=2 の場合、幅/高さを 1/2 に縮小します
+#   ※ skip_extract=true の場合、フレーム抽出をスキップします
 #
 # 前提:
 # - videos_dir には cam01.mp4, cam02.mp4, ... のようにカメラ名付き動画がある
 # - すべての動画は同じFPS・同時刻開始で撮影されている
 #
 # 出力:
-#   data_dir/images/  に各カメラのフレーム画像
+#   data_dir/images/  に各カメラのフレーム画像（png）
 #   data_dir/sparse/0 に COLMAP の再構成結果
 # ---------------------------------------------
 
-if [[ $# -lt 4 || $# -gt 5 ]]; then
-  echo "Usage: $0 <videos_dir> <data_dir> <frame_start> <frame_end> [fps]"
+if [[ $# -lt 4 || $# -gt 7 ]]; then
+  echo "Usage: $0 <videos_dir> <data_dir> <frame_start> <frame_end> [fps] [downsample] [skip_extract]"
   exit 1
 fi
 
@@ -29,6 +32,8 @@ DATA_DIR="$2"
 FRAME_START="$3"
 FRAME_END="$4"
 FPS="${5:-30}"
+DOWNSAMPLE="${6:-1}"
+SKIP_EXTRACT="${7:-false}"
 
 IMAGES_DIR="$DATA_DIR/images"
 SPARSE_DIR="$DATA_DIR/sparse"
@@ -44,30 +49,38 @@ mkdir -p "$SPARSE_DIR"
 #    - 抽出範囲は frame_start 〜 frame_end
 # ---------------------------------------------
 
-shopt -s nullglob
-VIDEO_FILES=("$VIDEOS_DIR"/*.mp4)
-if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
-  echo "[ERROR] $VIDEOS_DIR に mp4 が見つかりません"
-  exit 1
+if [[ "${SKIP_EXTRACT}" == "true" ]]; then
+  echo "[INFO] フレーム抽出をスキップします (skip_extract=true)"
+else
+  shopt -s nullglob
+  VIDEO_FILES=("$VIDEOS_DIR"/*.mp4)
+  if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
+    echo "[ERROR] $VIDEOS_DIR に mp4 が見つかりません"
+    exit 1
+  fi
+
+  for video_path in "${VIDEO_FILES[@]}"; do
+    video_file="$(basename "$video_path")"
+    cam_name="${video_file%.*}"
+
+    echo "[INFO] 抽出開始: $video_file"
+
+    # フレーム番号は抽出範囲内で 000000 から振り直します。
+    # 全カメラで同じ範囲を切るので、同時刻は一致します。
+    VF_FILTER="fps=${FPS},select='between(n,${FRAME_START},${FRAME_END})'"
+    if [[ "$DOWNSAMPLE" != "1" ]]; then
+      VF_FILTER+=" ,scale=iw/${DOWNSAMPLE}:ih/${DOWNSAMPLE}"
+    fi
+
+    ffmpeg -y \
+      -i "$video_path" \
+      -vf "$VF_FILTER" \
+      -vsync 0 \
+      -start_number 0 \
+      "$IMAGES_DIR/${cam_name}_frame%06d.png"
+
+  done
 fi
-
-for video_path in "${VIDEO_FILES[@]}"; do
-  video_file="$(basename "$video_path")"
-  cam_name="${video_file%.*}"
-
-  echo "[INFO] 抽出開始: $video_file"
-
-  # フレーム番号は抽出範囲内で 000000 から振り直します。
-  # 全カメラで同じ範囲を切るので、同時刻は一致します。
-  ffmpeg -y \
-    -i "$video_path" \
-    -vf "fps=${FPS},select='between(n,${FRAME_START},${FRAME_END})'" \
-    -vsync 0 \
-    -qscale:v 2 \
-    -start_number 0 \
-    "$IMAGES_DIR/${cam_name}_frame%06d.jpg"
-
-done
 
 # ---------------------------------------------
 # 2) COLMAP で Sparse Reconstruction を作成
@@ -87,7 +100,7 @@ colmap database_creator \
 colmap feature_extractor \
   --database_path "$DB_PATH" \
   --image_path "$IMAGES_DIR" \
-  --ImageReader.single_camera 0
+  --ImageReader.single_camera 1
 
 # 画像マッチング（全画像を総当たり）
 colmap exhaustive_matcher \
