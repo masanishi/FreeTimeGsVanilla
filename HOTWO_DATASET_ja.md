@@ -52,10 +52,21 @@ sudo apt-get install -y \
 ### ビルド & インストール
 
 ```bash
+sudo apt install -y openimageio-tools libopenimageio-dev
+sudo apt-get install -y \
+    nvidia-cuda-toolkit \
+    nvidia-cuda-toolkit-gcc
+
 git clone https://github.com/colmap/colmap.git
 cd colmap
 mkdir build && cd build
-cmake .. -GNinja
+sudo apt install -y gcc-12 g++-12
+export CC=gcc-12
+export CXX=g++-12
+cmake .. -GNinja \
+  -DCMAKE_C_COMPILER=gcc-12 \
+  -DCMAKE_CXX_COMPILER=g++-12 \
+  -DCMAKE_CUDA_HOST_COMPILER=g++-12
 ninja
 sudo ninja install
 cd ../../
@@ -70,7 +81,7 @@ cd ../../
 ※ CUDA 12.8 でも **cu121** ホイールで動くケースが多いです。
 
 ```bash
-python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ### RoMa + 依存
