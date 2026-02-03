@@ -87,7 +87,7 @@ python -m pip install torch torchvision --index-url https://download.pytorch.org
 ### RoMa + 依存
 
 ```bash
-python -m pip install romatch opencv-python imageio pillow numpy
+python -m pip install "romatch[fused-local-corr]" opencv-python imageio pillow numpy
 ```
 
 ---

@@ -13,8 +13,8 @@ and folder layout (images/cam00/000000.png).
 """
 
 import argparse
-import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -23,6 +23,10 @@ import numpy as np
 import torch
 from PIL import Image
 from romatch import roma_outdoor
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.read_write_model import read_cameras_binary, read_images_binary, qvec2rotmat
 
