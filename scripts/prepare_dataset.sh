@@ -102,14 +102,11 @@ colmap feature_extractor \
   --database_path "$DB_PATH" \
   --image_path "$IMAGES_DIR" \
   --ImageReader.single_camera 1 \
-  --SiftExtraction.use_gpu 1 \
-  --SiftExtraction.gpu_index "$GPU_INDEX"
+  --FeatureExtraction.use_gpu 1
 
 # 画像マッチング（全画像を総当たり）
 colmap exhaustive_matcher \
-  --database_path "$DB_PATH" \
-  --SiftMatching.use_gpu 1 \
-  --SiftMatching.gpu_index "$GPU_INDEX"
+  --database_path "$DB_PATH"
 
 # 三角測量（Sparse Reconstruction）
 colmap mapper \
