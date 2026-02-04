@@ -13,6 +13,7 @@ and folder layout (images/cam00/000000.png).
 """
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,6 +24,10 @@ import numpy as np
 import torch
 from PIL import Image
 from romatch import roma_outdoor
+
+# Workaround for OpenMP duplicate runtime on macOS (can abort execution).
+# Prefer fixing the underlying lib linking, but this keeps the script usable.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:

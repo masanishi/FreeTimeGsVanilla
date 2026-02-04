@@ -22,55 +22,42 @@ cd FreeTimeGsVanilla
 
 ---
 
-## 2. Python 環境（venv）
+## 2. Python 環境（uv で統一）
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip
+sudo apt-get install -y python3
 
-python3 -m venv .venv
+uv venv .venv
 source .venv/bin/activate
 
-python -m pip install --upgrade pip
+uv pip install --upgrade pip
 ```
 
 ---
 
-## 3. COLMAP のビルド
+## 2.5. pycolmap（CUDA12 対応）をインストール
 
-### 依存パッケージ
-
-```bash
-sudo apt-get install -y \
-  build-essential cmake ninja-build git pkg-config \
-  libatlas-base-dev libsuitesparse-dev libgoogle-glog-dev libgflags-dev \
-  libeigen3-dev libopencv-dev libboost-program-options-dev \
-  libboost-filesystem-dev libboost-graph-dev libboost-system-dev \
-  libfreeimage-dev libmetis-dev libceres-dev qtbase5-dev libqt5opengl5-dev
-```
-
-### ビルド & インストール
+pycolmap の CUDA12 対応版は **パッケージ名が違っても import 名は `pycolmap`** です。
 
 ```bash
-sudo apt install -y openimageio-tools libopenimageio-dev
-sudo apt-get install -y \
-    nvidia-cuda-toolkit \
-    nvidia-cuda-toolkit-gcc
-
-git clone https://github.com/colmap/colmap.git
-cd colmap
-mkdir build && cd build
-sudo apt install -y gcc-12 g++-12
-export CC=gcc-12
-export CXX=g++-12
-cmake .. -GNinja \
-  -DCMAKE_C_COMPILER=gcc-12 \
-  -DCMAKE_CXX_COMPILER=g++-12 \
-  -DCMAKE_CUDA_HOST_COMPILER=g++-12
-ninja
-sudo ninja install
-cd ../../
+# CUDA12 対応ビルドをインストール
+uv pip install pycolmap-cuda12
 ```
+
+### 依存ライブラリ（Ubuntu）
+
+pycolmap のバックエンドが読み込めない場合は X11 依存が不足している可能性があります。
+
+```bash
+sudo apt-get install -y libsm6 libxext6 libxrender1 libice6
+```
+
+---
+
+## 3. COLMAP（CLI も選択可）
+
+基本は `pycolmap` を使いますが、**CUDA対応の `colmap` CLI** でも再構成できます。
 
 ---
 
@@ -81,13 +68,13 @@ cd ../../
 ※ CUDA 12.8 でも **cu121** ホイールで動くケースが多いです。
 
 ```bash
-python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ### RoMa + 依存
 
 ```bash
-python -m pip install "romatch[fused-local-corr]" opencv-python imageio pillow numpy
+uv pip install "romatch[fused-local-corr]" opencv-python imageio pillow numpy
 ```
 
 ---
@@ -123,7 +110,21 @@ dataset/images/
 
 ---
 
-## 7. COLMAP 再構成
+## 7. COLMAP 再構成（pycolmap）
+
+CLI の `colmap` は使わず、`pycolmap` で再構成します。
+
+```bash
+python scripts/prepare_dataset.py ./dance ./dataset 0 60 60 2 true --use-gpu 1
+```
+
+結果は `dataset/sparse/0/` に出力されます。
+
+---
+
+## 7.1 COLMAP 再構成（CLI / CUDA 対応版）
+
+CUDA 対応の `colmap` を使う場合のコマンド例です。
 
 ```bash
 colmap database_creator --database_path dataset/database.db
@@ -131,14 +132,18 @@ colmap database_creator --database_path dataset/database.db
 colmap feature_extractor \
   --database_path dataset/database.db \
   --image_path dataset/images \
-  --ImageReader.single_camera 1
+  --ImageReader.single_camera 1 \
+  --FeatureExtraction.use_gpu 1
 
-colmap exhaustive_matcher --database_path dataset/database.db
+colmap exhaustive_matcher \
+  --database_path dataset/database.db \
+  --FeatureMatching.use_gpu 1
 
 colmap mapper \
   --database_path dataset/database.db \
   --image_path dataset/images \
-  --output_path dataset/sparse
+  --output_path dataset/sparse \
+  --Mapper.ba_use_gpu 1
 ```
 
 結果は `dataset/sparse/0/` に出力されます。
@@ -152,7 +157,7 @@ python scripts/roma_triangulate_to_npy.py \
   --data-dir ./dataset \
   --out-dir ./triangulation_output \
   --frame-start 0 \
-  --frame-end 60 \
+  --frame-end 5 \
   --ref-cam 0000 \
   --use-ransac
 ```
@@ -174,7 +179,7 @@ python src/combine_frames_fast_keyframes.py \
   --input-dir ./triangulation_output \
   --output-path ./keyframes.npz \
   --frame-start 0 \
-  --frame-end 60 \
+  --frame-end 5 \
   --keyframe-step 5
 ```
 
@@ -197,9 +202,9 @@ CUDA_VISIBLE_DEVICES=0 python src/simple_trainer_freetime_4d_pure_relocation.py 
 
 `scripts` フォルダのスクリプトは **データセット準備用途**です。README の入力要件（`images/` はフラット構成）と整合する使い方は以下です。
 
-### 一括で画像抽出 + COLMAP まで
+### 一括で画像抽出 + COLMAP まで（pycolmap）
 
-`scripts/prepare_dataset.sh` は **手順 5〜7 をまとめて実行**します。
+`scripts/prepare_dataset.sh` は **手順 5〜7 をまとめて実行**します（CLI の `colmap` は使いません）。
 
 ```bash
 ./scripts/prepare_dataset.sh <videos_dir> <data_dir> <frame_start> <frame_end> [fps] [downsample] [skip_extract]
