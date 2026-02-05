@@ -18,6 +18,7 @@ ROMA_CERTAINTY=0.3
 ROMA_USE_RANSAC=0
 ROMA_RANSAC_TH=0.5
 ROMA_MIN_DEPTH=1e-4
+RESIZE_SCALE="0.5"
 TRIANGULATION_DIR=""
 NPZ_PATH=""
 
@@ -25,6 +26,7 @@ usage() {
   echo "Usage: $0 [--root-dir PATH] [--frame-time SEC] [--num-cameras N] [--num-frames N] [--skip-colmap]"
   echo "          [--run-roma] [--run-combine] [--keyframe-step N]"
   echo "          [--triangulation-dir PATH] [--npz-path PATH]"
+  echo "          [--resize-scale SCALE]"
   echo "          [--roma-ref-cam ID] [--roma-device DEV] [--roma-certainty TH]"
   echo "          [--roma-use-ransac] [--roma-ransac-th PX] [--roma-min-depth D]"
 }
@@ -95,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       ROMA_MIN_DEPTH="$2"
       shift 2
       ;;
+    --resize-scale)
+      RESIZE_SCALE="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -124,6 +130,11 @@ fi
 
 if [[ -z "$NPZ_PATH" ]]; then
   NPZ_PATH="$DEFAULT_NPZ_PATH"
+fi
+
+FFMPEG_SCALE_FILTER=""
+if [[ "$RESIZE_SCALE" != "1" && "$RESIZE_SCALE" != "1.0" ]]; then
+  FFMPEG_SCALE_FILTER="-vf scale=iw*${RESIZE_SCALE}:ih*${RESIZE_SCALE}"
 fi
 
 ROMA_ARGS=(
@@ -159,6 +170,7 @@ if [[ $SKIP_COLMAP -eq 0 ]]; then
     ffmpeg -y \
       -ss "$FRAME_TIME" \
       -i "$VIDEO_DIR/$i.mp4" \
+      $FFMPEG_SCALE_FILTER \
       -frames:v 1 \
       "$IMG_DIR/cam$i.png"
   done
@@ -243,6 +255,7 @@ if [[ $RUN_ROMA -eq 1 ]]; then
 
       ffmpeg -y \
         -i "$video_path" \
+        $FFMPEG_SCALE_FILTER \
         -frames:v "$NUM_FRAMES" \
         -vsync 0 \
         -start_number 0 \
