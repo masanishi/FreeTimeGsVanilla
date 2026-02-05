@@ -420,13 +420,14 @@ def main() -> None:
 
                 with torch.inference_mode(), amp_context(args.device, args.amp):
                     warp, certainty = roma_model.match(str(ref_path_scaled), str(other_path_scaled), device=args.device)
-                    matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
 
-                # Move to CPU early to avoid accumulating large GPU tensors across frames.
-                matches = matches.detach().cpu()
-                cert = cert.detach().cpu()
-                del warp, certainty
+                # Move RoMa outputs to CPU before sampling to minimize VRAM growth across frames.
+                warp = warp.detach().cpu()
+                certainty = certainty.detach().cpu()
                 maybe_clear_device_cache(args.device)
+
+                matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
+                del warp, certainty
 
                 if matches is None or cert is None or len(matches) == 0:
                     continue
