@@ -236,8 +236,8 @@ def find_frame_image(images_dir: Path, cam_id: str, frame_idx: int) -> Optional[
 
 
 def load_image_rgb(path: Path) -> np.ndarray:
-    image = Image.open(path).convert("RGB")
-    return np.array(image)
+    with Image.open(path) as image:
+        return np.array(image.convert("RGB"))
 
 
 def sample_colors(image: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -331,123 +331,130 @@ def main() -> None:
             print(f"[WARN] Missing reference image for frame {frame_idx:06d}. Skipping.")
             continue
 
-        ref_image = load_image_rgb(ref_path)
-        ref_h, ref_w = ref_image.shape[:2]
-
+        ref_image = None
         all_points = []
         all_colors = []
 
-        for cam_id, params in cam_params.items():
-            if cam_id == args.ref_cam:
+        try:
+            ref_image = load_image_rgb(ref_path)
+            ref_h, ref_w = ref_image.shape[:2]
+
+            for cam_id, params in cam_params.items():
+                if cam_id == args.ref_cam:
+                    continue
+
+                other_path = find_frame_image(images_dir, cam_id, frame_idx)
+                if other_path is None:
+                    continue
+
+                with torch.inference_mode():
+                    warp, certainty = roma_model.match(str(ref_path), str(other_path), device=args.device)
+                    matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
+
+                # Move to CPU early to avoid accumulating large GPU tensors across frames.
+                matches = matches.detach().cpu()
+                cert = cert.detach().cpu()
+                del warp, certainty
+                maybe_clear_device_cache(args.device)
+
+                if matches is None or cert is None or len(matches) == 0:
+                    continue
+
+                cert = cert.squeeze()
+                keep = cert >= args.certainty
+                if keep.sum().item() == 0:
+                    continue
+
+                matches = matches[keep]
+                cert = cert[keep]
+
+                other_image = None
+                try:
+                    other_image = load_image_rgb(other_path)
+                    other_h, other_w = other_image.shape[:2]
+
+                    kpts_ref, kpts_other = roma_model.to_pixel_coordinates(matches, ref_h, ref_w, other_h, other_w)
+                    kpts_ref = kpts_ref.numpy().astype(np.float64)
+                    kpts_other = kpts_other.numpy().astype(np.float64)
+
+                    if len(kpts_ref) > args.max_matches:
+                        idx = np.random.choice(len(kpts_ref), args.max_matches, replace=False)
+                        kpts_ref = kpts_ref[idx]
+                        kpts_other = kpts_other[idx]
+
+                    if cv2 is not None and args.use_ransac:
+                        F, mask = cv2.findFundamentalMat(
+                            kpts_ref,
+                            kpts_other,
+                            ransacReprojThreshold=args.ransac_th,
+                            method=cv2.USAC_MAGSAC,
+                            confidence=0.999,
+                            maxIters=10000,
+                        )
+                        if mask is not None:
+                            mask = mask.ravel().astype(bool)
+                            kpts_ref = kpts_ref[mask]
+                            kpts_other = kpts_other[mask]
+
+                    if len(kpts_ref) == 0:
+                        continue
+
+                    P1 = cam_params[args.ref_cam]["P"]
+                    P2 = params["P"]
+                    R1, t1 = cam_params[args.ref_cam]["R"], cam_params[args.ref_cam]["t"]
+                    R2, t2 = params["R"], params["t"]
+
+                    points3d = triangulate_points(P1, P2, kpts_ref, kpts_other)
+
+                    z1 = (R1 @ points3d.T + t1).T[:, 2]
+                    z2 = (R2 @ points3d.T + t2).T[:, 2]
+                    depth_mask = (z1 > args.min_depth) & (z2 > args.min_depth)
+
+                    if depth_mask.sum() == 0:
+                        continue
+
+                    points3d = points3d[depth_mask]
+                    kpts_ref = kpts_ref[depth_mask]
+                    kpts_other = kpts_other[depth_mask]
+
+                    err1 = reprojection_error(P1, points3d, kpts_ref)
+                    err2 = reprojection_error(P2, points3d, kpts_other)
+                    reproj_mask = (err1 < args.max_reproj) & (err2 < args.max_reproj)
+
+                    if reproj_mask.sum() == 0:
+                        continue
+
+                    points3d = points3d[reproj_mask]
+                    kpts_ref = kpts_ref[reproj_mask]
+
+                    colors = sample_colors(ref_image, kpts_ref)
+
+                    all_points.append(points3d.astype(np.float32))
+                    all_colors.append(colors.astype(np.float32))
+                    del kpts_ref, kpts_other, points3d, colors
+                finally:
+                    del other_image, matches, cert
+                    maybe_clear_device_cache(args.device)
+
+            if len(all_points) == 0:
+                print(f"[WARN] No points generated for frame {frame_idx:06d}")
                 continue
 
-            other_path = find_frame_image(images_dir, cam_id, frame_idx)
-            if other_path is None:
-                continue
+            points = np.concatenate(all_points, axis=0)
+            colors = np.concatenate(all_colors, axis=0)
 
-            with torch.inference_mode():
-                warp, certainty = roma_model.match(str(ref_path), str(other_path), device=args.device)
-                matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
+            points, colors = voxel_downsample(points, colors, args.voxel_size)
 
-            # Move to CPU early to avoid accumulating large GPU tensors across frames.
-            matches = matches.detach().cpu()
-            cert = cert.detach().cpu()
-            del warp, certainty
+            points_path = output_dir / f"points3d_frame{frame_idx:06d}.npy"
+            colors_path = output_dir / f"colors_frame{frame_idx:06d}.npy"
+
+            np.save(points_path, points)
+            np.save(colors_path, colors)
+
+            print(f"[Frame {frame_idx:06d}] points={len(points)} saved to {output_dir}")
+        finally:
+            del ref_image, all_points, all_colors
             maybe_clear_device_cache(args.device)
-
-            if matches is None or cert is None or len(matches) == 0:
-                continue
-
-            cert = cert.squeeze()
-            keep = cert >= args.certainty
-            if keep.sum().item() == 0:
-                continue
-
-            matches = matches[keep]
-            cert = cert[keep]
-
-            other_image = load_image_rgb(other_path)
-            other_h, other_w = other_image.shape[:2]
-
-            kpts_ref, kpts_other = roma_model.to_pixel_coordinates(matches, ref_h, ref_w, other_h, other_w)
-            kpts_ref = kpts_ref.numpy().astype(np.float64)
-            kpts_other = kpts_other.numpy().astype(np.float64)
-
-            if len(kpts_ref) > args.max_matches:
-                idx = np.random.choice(len(kpts_ref), args.max_matches, replace=False)
-                kpts_ref = kpts_ref[idx]
-                kpts_other = kpts_other[idx]
-
-            if cv2 is not None and args.use_ransac:
-                F, mask = cv2.findFundamentalMat(
-                    kpts_ref,
-                    kpts_other,
-                    ransacReprojThreshold=args.ransac_th,
-                    method=cv2.USAC_MAGSAC,
-                    confidence=0.999,
-                    maxIters=10000,
-                )
-                if mask is not None:
-                    mask = mask.ravel().astype(bool)
-                    kpts_ref = kpts_ref[mask]
-                    kpts_other = kpts_other[mask]
-
-            if len(kpts_ref) == 0:
-                continue
-
-            P1 = cam_params[args.ref_cam]["P"]
-            P2 = params["P"]
-            R1, t1 = cam_params[args.ref_cam]["R"], cam_params[args.ref_cam]["t"]
-            R2, t2 = params["R"], params["t"]
-
-            points3d = triangulate_points(P1, P2, kpts_ref, kpts_other)
-
-            z1 = (R1 @ points3d.T + t1).T[:, 2]
-            z2 = (R2 @ points3d.T + t2).T[:, 2]
-            depth_mask = (z1 > args.min_depth) & (z2 > args.min_depth)
-
-            if depth_mask.sum() == 0:
-                continue
-
-            points3d = points3d[depth_mask]
-            kpts_ref = kpts_ref[depth_mask]
-            kpts_other = kpts_other[depth_mask]
-
-            err1 = reprojection_error(P1, points3d, kpts_ref)
-            err2 = reprojection_error(P2, points3d, kpts_other)
-            reproj_mask = (err1 < args.max_reproj) & (err2 < args.max_reproj)
-
-            if reproj_mask.sum() == 0:
-                continue
-
-            points3d = points3d[reproj_mask]
-            kpts_ref = kpts_ref[reproj_mask]
-
-            colors = sample_colors(ref_image, kpts_ref)
-
-            all_points.append(points3d.astype(np.float32))
-            all_colors.append(colors.astype(np.float32))
-            del kpts_ref, kpts_other, points3d, colors
-            maybe_clear_device_cache(args.device)
-
-        if len(all_points) == 0:
-            print(f"[WARN] No points generated for frame {frame_idx:06d}")
-            continue
-
-        points = np.concatenate(all_points, axis=0)
-        colors = np.concatenate(all_colors, axis=0)
-
-        points, colors = voxel_downsample(points, colors, args.voxel_size)
-
-        points_path = output_dir / f"points3d_frame{frame_idx:06d}.npy"
-        colors_path = output_dir / f"colors_frame{frame_idx:06d}.npy"
-
-        np.save(points_path, points)
-        np.save(colors_path, colors)
-
-        print(f"[Frame {frame_idx:06d}] points={len(points)} saved to {output_dir}")
-        del points, colors, all_points, all_colors, ref_image
-        maybe_clear_device_cache(args.device)
 
 
 if __name__ == "__main__":
