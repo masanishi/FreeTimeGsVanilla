@@ -20,6 +20,7 @@ import sys
 import platform
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+from contextlib import nullcontext
 
 import gc
 import numpy as np
@@ -74,6 +75,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-reproj", type=float, default=2.0, help="Max reprojection error (px)")
     parser.add_argument("--voxel-size", type=float, default=0.0, help="Voxel size for optional downsampling (0 = off)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for subsampling")
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=1.0,
+        help="Scale input images for RoMa matching (e.g., 0.5 for half resolution).",
+    )
+    parser.add_argument("--amp", action="store_true", help="Enable AMP (fp16) during RoMa inference")
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="Optional cache directory for resized images (used when --image-scale != 1.0)",
+    )
     args = parser.parse_args()
 
     if args.data_dir:
@@ -102,6 +116,9 @@ def parse_args() -> argparse.Namespace:
         inferred = infer_max_frame(Path(args.images_dir), args.ref_cam)
         if inferred is not None:
             args.frame_end = inferred
+
+    if args.image_scale <= 0:
+        raise ValueError("--image-scale must be > 0")
 
     args.device = resolve_device(args.device)
 
@@ -214,16 +231,25 @@ def camera_intrinsics(camera) -> np.ndarray:
     return K
 
 
-def build_camera_params(cameras, images) -> Dict[str, Dict[str, np.ndarray]]:
+def build_camera_params(cameras, images, image_scale: float = 1.0) -> Dict[str, Dict[str, np.ndarray]]:
     params = {}
     for img in images.values():
         cam_id = extract_cam_id(img.name)
         cam = cameras[img.camera_id]
         K = camera_intrinsics(cam)
+        if image_scale != 1.0:
+            K[:2] *= image_scale
         R = qvec2rotmat(img.qvec)
         t = img.tvec.reshape(3, 1)
         P = K @ np.hstack([R, t])
-        params[cam_id] = {"K": K, "R": R, "t": t, "P": P, "width": cam.width, "height": cam.height}
+        params[cam_id] = {
+            "K": K,
+            "R": R,
+            "t": t,
+            "P": P,
+            "width": int(round(cam.width * image_scale)),
+            "height": int(round(cam.height * image_scale)),
+        }
     return params
 
 
@@ -238,6 +264,28 @@ def find_frame_image(images_dir: Path, cam_id: str, frame_idx: int) -> Optional[
 def load_image_rgb(path: Path) -> np.ndarray:
     with Image.open(path) as image:
         return np.array(image.convert("RGB"))
+
+
+def resized_image_path(path: Path, scale: float, cache_dir: Path) -> Path:
+    scale_tag = f"s{scale:.3f}".replace(".", "p")
+    return cache_dir / f"{path.stem}_{scale_tag}{path.suffix}"
+
+
+def ensure_resized_image(path: Path, scale: float, cache_dir: Path) -> Path:
+    if scale == 1.0:
+        return path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    resized_path = resized_image_path(path, scale, cache_dir)
+    if resized_path.exists():
+        return resized_path
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        w, h = image.size
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = image.resize((new_w, new_h), resample=Image.LANCZOS)
+        resized.save(resized_path)
+    return resized_path
 
 
 def sample_colors(image: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -293,6 +341,16 @@ def maybe_clear_device_cache(device: str) -> None:
     gc.collect()
 
 
+def amp_context(device: str, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if device == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    if device == "mps":
+        return torch.autocast(device_type="mps", dtype=torch.float16)
+    return nullcontext()
+
+
 def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
@@ -302,7 +360,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cameras, images, _ = read_model(args.colmap_model)
-    cam_params = build_camera_params(cameras, images)
+    cam_params = build_camera_params(cameras, images, image_scale=args.image_scale)
 
     if args.ref_cam not in cam_params:
         raise ValueError(f"Reference camera {args.ref_cam} not found in COLMAP model")
@@ -325,6 +383,16 @@ def main() -> None:
 
     frame_indices = list(range(args.frame_start, args.frame_end + 1, args.frame_step))
 
+    if args.image_scale != 1.0:
+        if args.cache_dir is None:
+            scale_tag = f"s{args.image_scale:.3f}".replace(".", "p")
+            cache_dir = output_dir / f"_roma_cache_{scale_tag}"
+        else:
+            cache_dir = Path(args.cache_dir)
+        print(f"[INFO] Using image scale {args.image_scale} with cache dir: {cache_dir}")
+    else:
+        cache_dir = None
+
     for frame_idx in frame_indices:
         ref_path = find_frame_image(images_dir, args.ref_cam, frame_idx)
         if ref_path is None:
@@ -336,7 +404,8 @@ def main() -> None:
         all_colors = []
 
         try:
-            ref_image = load_image_rgb(ref_path)
+            ref_path_scaled = ensure_resized_image(ref_path, args.image_scale, cache_dir) if cache_dir else ref_path
+            ref_image = load_image_rgb(ref_path_scaled)
             ref_h, ref_w = ref_image.shape[:2]
 
             for cam_id, params in cam_params.items():
@@ -347,8 +416,10 @@ def main() -> None:
                 if other_path is None:
                     continue
 
-                with torch.inference_mode():
-                    warp, certainty = roma_model.match(str(ref_path), str(other_path), device=args.device)
+                other_path_scaled = ensure_resized_image(other_path, args.image_scale, cache_dir) if cache_dir else other_path
+
+                with torch.inference_mode(), amp_context(args.device, args.amp):
+                    warp, certainty = roma_model.match(str(ref_path_scaled), str(other_path_scaled), device=args.device)
                     matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
 
                 # Move to CPU early to avoid accumulating large GPU tensors across frames.
@@ -370,7 +441,7 @@ def main() -> None:
 
                 other_image = None
                 try:
-                    other_image = load_image_rgb(other_path)
+                    other_image = load_image_rgb(other_path_scaled)
                     other_h, other_w = other_image.shape[:2]
 
                     kpts_ref, kpts_other = roma_model.to_pixel_coordinates(matches, ref_h, ref_w, other_h, other_w)

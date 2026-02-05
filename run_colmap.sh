@@ -18,6 +18,9 @@ ROMA_CERTAINTY=0.3
 ROMA_USE_RANSAC=0
 ROMA_RANSAC_TH=0.5
 ROMA_MIN_DEPTH=1e-4
+ROMA_IMAGE_SCALE="1.0"
+ROMA_AMP=0
+ROMA_CACHE_DIR=""
 RESIZE_SCALE="0.5"
 TRIANGULATION_DIR=""
 NPZ_PATH=""
@@ -29,6 +32,7 @@ usage() {
   echo "          [--resize-scale SCALE]"
   echo "          [--roma-ref-cam ID] [--roma-device DEV] [--roma-certainty TH]"
   echo "          [--roma-use-ransac] [--roma-ransac-th PX] [--roma-min-depth D]"
+  echo "          [--roma-image-scale SCALE] [--roma-amp] [--roma-cache-dir PATH]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -97,6 +101,18 @@ while [[ $# -gt 0 ]]; do
       ROMA_MIN_DEPTH="$2"
       shift 2
       ;;
+    --roma-image-scale)
+      ROMA_IMAGE_SCALE="$2"
+      shift 2
+      ;;
+    --roma-amp)
+      ROMA_AMP=1
+      shift
+      ;;
+    --roma-cache-dir)
+      ROMA_CACHE_DIR="$2"
+      shift 2
+      ;;
     --resize-scale)
       RESIZE_SCALE="$2"
       shift 2
@@ -149,6 +165,18 @@ ROMA_ARGS=(
   --certainty "$ROMA_CERTAINTY"
   --min-depth "$ROMA_MIN_DEPTH"
 )
+
+if [[ "$ROMA_IMAGE_SCALE" != "1" && "$ROMA_IMAGE_SCALE" != "1.0" ]]; then
+  ROMA_ARGS+=(--image-scale "$ROMA_IMAGE_SCALE")
+fi
+
+if [[ $ROMA_AMP -eq 1 ]]; then
+  ROMA_ARGS+=(--amp)
+fi
+
+if [[ -n "$ROMA_CACHE_DIR" ]]; then
+  ROMA_ARGS+=(--cache-dir "$ROMA_CACHE_DIR")
+fi
 
 if [[ $ROMA_USE_RANSAC -eq 1 ]]; then
   ROMA_ARGS+=(--use-ransac --ransac-th "$ROMA_RANSAC_TH")
