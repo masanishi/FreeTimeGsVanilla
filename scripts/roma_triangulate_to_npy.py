@@ -60,6 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Torch device (auto/cuda/mps/cpu)")
     parser.add_argument("--roma-model", choices=["roma_outdoor", "tiny_roma_v1_outdoor"], default="roma_outdoor")
     parser.add_argument("--certainty", type=float, default=0.3, help="RoMa certainty threshold")
+    parser.add_argument(
+        "--sample-mode",
+        default="threshold",
+        choices=["threshold", "threshold_balanced"],
+        help="RoMa sample mode. 'threshold' avoids KDE OOM; 'threshold_balanced' may be higher quality but heavy.",
+    )
+    parser.add_argument("--sample-thresh", type=float, default=0.05, help="RoMa sample threshold")
     parser.add_argument("--use-ransac", action="store_true", help="Use RANSAC to filter matches (requires OpenCV)")
     parser.add_argument("--ransac-th", type=float, default=0.5, help="RANSAC reprojection threshold (px)")
     parser.add_argument("--max-matches", type=int, default=20000, help="Max matches per camera pair")
@@ -304,6 +311,8 @@ def main() -> None:
         roma_model = roma_outdoor(device=args.device)
     else:
         roma_model = tiny_roma_v1_outdoor(device=args.device)
+    roma_model.sample_mode = args.sample_mode
+    roma_model.sample_thresh = args.sample_thresh
 
     if args.use_ransac:
         try:
