@@ -120,9 +120,11 @@ def infer_max_frame(images_dir: Path, ref_cam: str) -> Optional[int]:
 
 
 def resolve_device(requested: str) -> str:
-    requested = requested.lower()
+    requested = requested.strip().lower()
     normalized = requested
-    if requested.startswith("cuda:"):
+    if requested.startswith("cuda"):
+        normalized = "cuda"
+    if requested in {"gpu", "nvidia"}:
         normalized = "cuda"
 
     cuda_ok = torch.cuda.is_available()
