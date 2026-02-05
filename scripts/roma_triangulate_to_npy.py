@@ -21,6 +21,7 @@ import platform
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+import gc
 import numpy as np
 from PIL import Image
 
@@ -277,9 +278,12 @@ def voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size: float) 
 
 def maybe_clear_device_cache(device: str) -> None:
     if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     elif device == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
         torch.mps.empty_cache()
+    gc.collect()
 
 
 def main() -> None:
@@ -414,6 +418,8 @@ def main() -> None:
 
             all_points.append(points3d.astype(np.float32))
             all_colors.append(colors.astype(np.float32))
+            del kpts_ref, kpts_other, points3d, colors
+            maybe_clear_device_cache(args.device)
 
         if len(all_points) == 0:
             print(f"[WARN] No points generated for frame {frame_idx:06d}")
@@ -431,6 +437,8 @@ def main() -> None:
         np.save(colors_path, colors)
 
         print(f"[Frame {frame_idx:06d}] points={len(points)} saved to {output_dir}")
+        del points, colors, all_points, all_colors, ref_image
+        maybe_clear_device_cache(args.device)
 
 
 if __name__ == "__main__":
