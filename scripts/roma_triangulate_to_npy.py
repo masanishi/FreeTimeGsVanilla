@@ -134,6 +134,16 @@ def resolve_device(requested: str) -> str:
     mps_ok = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
     mps_has_current = hasattr(torch.mps, "current_device")
 
+    print(
+        "[INFO] Device check:",
+        f"requested='{requested}'",
+        f"normalized='{normalized}'",
+        f"cuda_available={cuda_ok}",
+        f"cuda_count={torch.cuda.device_count() if cuda_ok else 0}",
+        f"mps_available={mps_ok}",
+        f"mps_has_current={mps_has_current}",
+    )
+
     if normalized == "auto":
         if cuda_ok:
             return "cuda"
@@ -147,6 +157,9 @@ def resolve_device(requested: str) -> str:
             return "mps"
         print("[WARN] CUDA not available. Falling back to CPU.")
         return "cpu"
+
+    if normalized == "cuda" and cuda_ok:
+        return "cuda"
 
     if normalized == "mps":
         if not mps_ok or not mps_has_current:
