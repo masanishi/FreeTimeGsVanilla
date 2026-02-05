@@ -121,32 +121,35 @@ def infer_max_frame(images_dir: Path, ref_cam: str) -> Optional[int]:
 
 def resolve_device(requested: str) -> str:
     requested = requested.lower()
+    normalized = requested
+    if requested.startswith("cuda:"):
+        normalized = "cuda"
 
     cuda_ok = torch.cuda.is_available()
     mps_ok = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
     mps_has_current = hasattr(torch.mps, "current_device")
 
-    if requested == "auto":
+    if normalized == "auto":
         if cuda_ok:
             return "cuda"
         if mps_ok and mps_has_current:
             return "mps"
         return "cpu"
 
-    if requested == "cuda" and not cuda_ok:
+    if normalized == "cuda" and not cuda_ok:
         if mps_ok and mps_has_current:
             print("[WARN] CUDA not available. Falling back to MPS.")
             return "mps"
         print("[WARN] CUDA not available. Falling back to CPU.")
         return "cpu"
 
-    if requested == "mps":
+    if normalized == "mps":
         if not mps_ok or not mps_has_current:
             print("[WARN] MPS not available or incomplete. Falling back to CPU.")
             return "cpu"
         return "mps"
 
-    if requested == "cpu":
+    if normalized == "cpu":
         return "cpu"
 
     print(f"[WARN] Unknown device '{requested}'. Falling back to CPU.")
