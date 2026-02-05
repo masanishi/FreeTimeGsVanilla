@@ -275,6 +275,13 @@ def voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size: float) 
     return points[unique_idx], colors[unique_idx]
 
 
+def maybe_clear_device_cache(device: str) -> None:
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
 def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
@@ -327,7 +334,13 @@ def main() -> None:
 
             with torch.inference_mode():
                 warp, certainty = roma_model.match(str(ref_path), str(other_path), device=args.device)
-                matches, cert = roma_model.sample(warp, certainty)
+                matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
+
+            # Move to CPU early to avoid accumulating large GPU tensors across frames.
+            matches = matches.detach().cpu()
+            cert = cert.detach().cpu()
+            del warp, certainty
+            maybe_clear_device_cache(args.device)
 
             if matches is None or cert is None or len(matches) == 0:
                 continue
@@ -344,8 +357,8 @@ def main() -> None:
             other_h, other_w = other_image.shape[:2]
 
             kpts_ref, kpts_other = roma_model.to_pixel_coordinates(matches, ref_h, ref_w, other_h, other_w)
-            kpts_ref = kpts_ref.cpu().numpy().astype(np.float64)
-            kpts_other = kpts_other.cpu().numpy().astype(np.float64)
+            kpts_ref = kpts_ref.numpy().astype(np.float64)
+            kpts_other = kpts_other.numpy().astype(np.float64)
 
             if len(kpts_ref) > args.max_matches:
                 idx = np.random.choice(len(kpts_ref), args.max_matches, replace=False)
