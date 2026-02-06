@@ -201,6 +201,7 @@ class FreeTimeParser:
                 os.path.join(sparse_dir, "0"),  # Reference COLMAP (clean SfM)
                 os.path.join(sparse_dir, f"frame_{start_frame:06d}"),  # Per-frame
                 os.path.join(sparse_dir, "frame_000000"),
+                os.path.join(data_dir, "colmap", "sparse/0"),
                 os.path.join(data_dir, f"colmap_{start_frame}", "sparse/0"),
             ]
             for candidate in candidates:

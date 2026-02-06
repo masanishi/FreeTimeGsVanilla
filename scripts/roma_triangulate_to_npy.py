@@ -126,24 +126,31 @@ def try_init_roma(device, amp):
 
     amp_dtype = torch.float16 if amp else torch.float32
     if hasattr(romatch, "roma_outdoor"):
-        return romatch.roma_outdoor(device=device, amp_dtype=amp_dtype, symmetric=False)
-    if hasattr(romatch, "roma_indoor"):
-        return romatch.roma_indoor(device=device, amp_dtype=amp_dtype, symmetric=False)
-    if hasattr(romatch, "tiny_roma_v1_outdoor"):
-        return romatch.tiny_roma_v1_outdoor(device=device)
-    return None
+        matcher = romatch.roma_outdoor(device=device, amp_dtype=amp_dtype, symmetric=False)
+    elif hasattr(romatch, "roma_indoor"):
+        matcher = romatch.roma_indoor(device=device, amp_dtype=amp_dtype, symmetric=False)
+    elif hasattr(romatch, "tiny_roma_v1_outdoor"):
+        matcher = romatch.tiny_roma_v1_outdoor(device=device)
+    else:
+        return None
+
+    if hasattr(matcher, "eval"):
+        matcher.eval()
+    return matcher
 
 
 def match_roma(matcher, img0, img1, cert_th=0.3, max_matches=20000):
-    warp, certainty = matcher.match(img0, img1, batched=True)
+    with torch.inference_mode():
+        warp_t, certainty_t = matcher.match(img0, img1, batched=True)
 
-    if warp.ndim == 4:
-        warp = warp[0]
-    if certainty.ndim == 3:
-        certainty = certainty[0]
+    if warp_t.ndim == 4:
+        warp_t = warp_t[0]
+    if certainty_t.ndim == 3:
+        certainty_t = certainty_t[0]
 
-    warp = warp.detach().cpu().numpy()
-    certainty = certainty.detach().cpu().numpy()
+    warp = warp_t.detach().cpu().numpy()
+    certainty = certainty_t.detach().cpu().numpy()
+    del warp_t, certainty_t
 
     h, w, _ = warp.shape
     flat_warp = warp.reshape(-1, 4)
@@ -344,6 +351,9 @@ def main():
             all_points.append(X)
             all_colors.append(colors)
 
+            del other_img, other_pil, ref_pil, pts0, pts1, scores, X, colors
+
+
         if len(all_points) == 0:
             print(f"[WARN] no points for frame {frame_idx}")
             continue
@@ -362,6 +372,8 @@ def main():
         np.save(output_dir / f"colors_frame{frame_idx:06d}.npy", colors)
 
         print(f"[Frame {frame_idx:06d}] points={len(points)} | {format_memory_stats(args.device)}")
+
+        del points, colors, all_points, all_colors, ref_img
 
 
 if __name__ == "__main__":
