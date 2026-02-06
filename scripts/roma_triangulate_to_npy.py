@@ -140,6 +140,14 @@ def try_init_roma(device, amp):
 
 
 def match_roma(matcher, img0, img1, cert_th=0.3, max_matches=20000):
+    # Get input image dimensions for correct coordinate conversion.
+    # RoMa outputs normalized coords in [-1, 1]. The official conversion is:
+    #   pixel_x = W / 2 * (norm_x + 1)
+    # where W, H are the ORIGINAL input image dimensions, NOT the warp map resolution.
+    # (roma_outdoor outputs warp at internal upsample_res e.g. 864x1152)
+    W_A, H_A = img0.size  # PIL Image.size returns (width, height)
+    W_B, H_B = img1.size
+
     with torch.inference_mode():
         warp_t, certainty_t = matcher.match(img0, img1, batched=True)
 
@@ -168,10 +176,12 @@ def match_roma(matcher, img0, img1, cert_th=0.3, max_matches=20000):
         pts = pts[idx]
         scores = scores[idx]
 
-    ax = (pts[:, 0] + 1.0) * 0.5 * (w - 1)
-    ay = (pts[:, 1] + 1.0) * 0.5 * (h - 1)
-    bx = (pts[:, 2] + 1.0) * 0.5 * (w - 1)
-    by = (pts[:, 3] + 1.0) * 0.5 * (h - 1)
+    # Convert normalized [-1,1] → pixel coords using input image dimensions
+    # (matches RoMa's to_pixel_coordinates / warp_to_pixel_coords)
+    ax = W_A / 2 * (pts[:, 0] + 1)
+    ay = H_A / 2 * (pts[:, 1] + 1)
+    bx = W_B / 2 * (pts[:, 2] + 1)
+    by = H_B / 2 * (pts[:, 3] + 1)
 
     pts0 = np.stack([ax, ay], axis=1).astype(np.float32)
     pts1 = np.stack([bx, by], axis=1).astype(np.float32)
@@ -261,6 +271,10 @@ def main():
         if args.device == "mps" and not torch.backends.mps.is_available():
             raise RuntimeError("MPS device requested but not available. Set --device cuda or enable MPS.")
 
+    if args.device == "mps" and os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") != "1":
+        print("[NOTICE] Setting PYTORCH_ENABLE_MPS_FALLBACK=1 to enable CPU fallback for unsupported MPS ops.")
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
     roma_matcher = try_init_roma(args.device, args.amp)
     if roma_matcher is None:
         raise RuntimeError("ROMA is not available. Install romatch and ensure GPU/MPS support is enabled.")
@@ -276,6 +290,10 @@ def main():
         if ref_img is None:
             print(f"[WARN] failed to read: {ref_path}")
             continue
+
+        # Keep original image in RGB for color sampling.
+        # Downstream (combine_frames / trainer) expects RGB, not BGR.
+        ref_img_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
 
         if args.image_scale != 1.0:
             ref_img = cv2.resize(ref_img, dsize=None, fx=args.image_scale, fy=args.image_scale)
@@ -347,7 +365,8 @@ def main():
             if len(X) == 0:
                 continue
 
-            colors = sample_colors(ref_img, pts0)
+            # Sample colors from original-scale RGB image (pts0 is in original-scale coords)
+            colors = sample_colors(ref_img_rgb, pts0)
             all_points.append(X)
             all_colors.append(colors)
 
@@ -373,7 +392,7 @@ def main():
 
         print(f"[Frame {frame_idx:06d}] points={len(points)} | {format_memory_stats(args.device)}")
 
-        del points, colors, all_points, all_colors, ref_img
+        del points, colors, all_points, all_colors, ref_img, ref_img_rgb
 
 
 if __name__ == "__main__":
