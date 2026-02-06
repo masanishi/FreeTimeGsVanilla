@@ -1,532 +1,367 @@
 #!/usr/bin/env python3
 """
-RoMa triangulation to per-frame NPY files.
+RoMa triangulation to per-frame NPY for FreeTimeGS.
 
-For each frame, it:
-- Loads a reference camera image and other camera images
-- Matches using RoMa (romatch)
-- Triangulates 3D points using fixed COLMAP camera poses
-- Saves points3d_frameXXXXXX.npy and colors_frameXXXXXX.npy
+This script:
+- Loads a reference COLMAP model (sparse/0) to get camera intrinsics/extrinsics
+- For each frame: matches reference camera to other cameras
+- Triangulates matches to 3D points
+- Saves points3d_frame%06d.npy and colors_frame%06d.npy
 
-This follows the paper's 4D initialization idea:
-- Triangulate per-frame 3D points from multi-view images
-- Initialize positions/time for that frame (velocity later)
+Default matcher is ROMA (paper). ROMA is required.
 """
 
 import argparse
 import os
-import re
-import sys
-import platform
 from pathlib import Path
-from typing import Dict, Tuple, Optional
-from contextlib import nullcontext
-
-import gc
 import numpy as np
+import cv2
 from PIL import Image
-
-if platform.system() == "Darwin" and os.environ.get("KMP_DUPLICATE_LIB_OK") is None:
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    print("[WARN] macOS OpenMP duplication detected. Set KMP_DUPLICATE_LIB_OK=TRUE as a workaround.")
+import torch
+from tqdm import tqdm
 
 try:
-    import torch
-except Exception as exc:
-    raise RuntimeError("PyTorch is required to run RoMa triangulation.") from exc
-
-from romatch import roma_outdoor, tiny_roma_v1_outdoor
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from datasets.read_write_model import read_model, qvec2rotmat
-
-
-SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+    from pycolmap import Reconstruction as PyColmapReconstruction
+    PYCOLMAP_API = "new"
+except ImportError:
+    try:
+        from pycolmap import SceneManager
+        PyColmapReconstruction = None
+        PYCOLMAP_API = "old"
+    except ImportError:
+        SceneManager = None
+        PyColmapReconstruction = None
+        PYCOLMAP_API = None
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RoMa triangulation to NPY")
-    parser.add_argument("--images-dir", help="Per-frame images dir")
-    parser.add_argument("--colmap-model", help="COLMAP sparse model dir (e.g., sparse/0)")
-    parser.add_argument("--output-dir", help="Output directory for NPY files")
-    parser.add_argument("--data-dir", help="(legacy) dataset root dir containing images/ and sparse/0")
-    parser.add_argument("--out-dir", help="(legacy) output dir for NPY files")
-    parser.add_argument("--frame-start", type=int, default=0, help="Start frame index")
-    parser.add_argument("--frame-end", type=int, default=0, help="End frame index (inclusive). 0 means auto")
-    parser.add_argument("--frame-step", type=int, default=1, help="Frame step")
-    parser.add_argument("--ref-cam", default="0000", help="Reference camera id (e.g., 0000)")
-    parser.add_argument("--device", default="auto", help="Torch device (auto/cuda/mps/cpu)")
-    parser.add_argument("--roma-model", choices=["roma_outdoor", "tiny_roma_v1_outdoor"], default="roma_outdoor")
-    parser.add_argument("--certainty", type=float, default=0.3, help="RoMa certainty threshold")
-    parser.add_argument(
-        "--sample-mode",
-        default="threshold",
-        choices=["threshold", "threshold_balanced"],
-        help="RoMa sample mode. 'threshold' avoids KDE OOM; 'threshold_balanced' may be higher quality but heavy.",
-    )
-    parser.add_argument("--sample-thresh", type=float, default=0.05, help="RoMa sample threshold")
-    parser.add_argument("--use-ransac", action="store_true", help="Use RANSAC to filter matches (requires OpenCV)")
-    parser.add_argument("--ransac-th", type=float, default=0.5, help="RANSAC reprojection threshold (px)")
-    parser.add_argument("--max-matches", type=int, default=20000, help="Max matches per camera pair")
-    parser.add_argument("--min-depth", type=float, default=1e-4, help="Min positive depth in both cameras")
-    parser.add_argument("--max-reproj", type=float, default=2.0, help="Max reprojection error (px)")
-    parser.add_argument("--voxel-size", type=float, default=0.0, help="Voxel size for optional downsampling (0 = off)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for subsampling")
-    parser.add_argument(
-        "--image-scale",
-        type=float,
-        default=1.0,
-        help="Scale input images for RoMa matching (e.g., 0.5 for half resolution).",
-    )
-    parser.add_argument("--amp", action="store_true", help="Enable AMP (fp16) during RoMa inference")
-    parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default=None,
-        help="Optional cache directory for resized images (used when --image-scale != 1.0)",
-    )
-    args = parser.parse_args()
+def load_colmap_cameras(colmap_dir: str):
+    if PYCOLMAP_API is None:
+        raise RuntimeError("pycolmap not found. Install with: pip install pycolmap")
 
-    if args.data_dir:
-        data_dir = Path(args.data_dir)
-        if args.images_dir is None:
-            args.images_dir = str(data_dir / "images")
-        if args.colmap_model is None:
-            args.colmap_model = str(data_dir / "sparse" / "0")
-    if args.out_dir and args.output_dir is None:
-        args.output_dir = args.out_dir
-
-    missing = [name for name in ("images_dir", "colmap_model", "output_dir") if getattr(args, name) is None]
-    if missing:
-        raise ValueError(
-            "Missing required arguments: "
-            + ", ".join(missing)
-            + ". Provide --images-dir --colmap-model --output-dir, or use --data-dir/--out-dir."
-        )
-
-    if args.frame_end == 0 and args.frame_start == 0:
-        inferred = infer_max_frame(Path(args.images_dir), args.ref_cam)
-        if inferred is not None:
-            args.frame_end = inferred
-
-    if args.frame_end < args.frame_start:
-        inferred = infer_max_frame(Path(args.images_dir), args.ref_cam)
-        if inferred is not None:
-            args.frame_end = inferred
-
-    if args.image_scale <= 0:
-        raise ValueError("--image-scale must be > 0")
-
-    args.device = resolve_device(args.device)
-
-    return args
-
-
-def infer_max_frame(images_dir: Path, ref_cam: str) -> Optional[int]:
-    pattern = re.compile(rf"^{re.escape(ref_cam)}_frame(\d+)$")
-    max_frame = None
-    for path in images_dir.iterdir():
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
-            continue
-        match = pattern.match(path.stem)
-        if not match:
-            continue
-        frame_idx = int(match.group(1))
-        if max_frame is None or frame_idx > max_frame:
-            max_frame = frame_idx
-    if max_frame is not None:
-        print(f"[INFO] Auto-detected frame_end={max_frame} from images in {images_dir}")
-    return max_frame
-
-
-def resolve_device(requested: str) -> str:
-    requested = requested.strip().lower().strip('"').strip("'")
-    if requested == "":
-        requested = "auto"
-
-    normalized = requested.replace(" ", "")
-    if "cuda" in normalized:
-        normalized = "cuda"
-    elif normalized in {"gpu", "nvidia"}:
-        normalized = "cuda"
-
-    cuda_ok = torch.cuda.is_available()
-    mps_ok = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
-    mps_has_current = hasattr(torch.mps, "current_device")
-
-    print(
-        "[INFO] Device check:",
-        f"requested='{requested}'",
-        f"normalized='{normalized}'",
-        f"cuda_available={cuda_ok}",
-        f"cuda_count={torch.cuda.device_count() if cuda_ok else 0}",
-        f"mps_available={mps_ok}",
-        f"mps_has_current={mps_has_current}",
-    )
-
-    if normalized == "auto":
-        if cuda_ok:
-            return "cuda"
-        if mps_ok and mps_has_current:
-            return "mps"
-        return "cpu"
-
-    if normalized == "cuda" and not cuda_ok:
-        if mps_ok and mps_has_current:
-            print("[WARN] CUDA not available. Falling back to MPS.")
-            return "mps"
-        print("[WARN] CUDA not available. Falling back to CPU.")
-        return "cpu"
-
-    if normalized == "cuda" and cuda_ok:
-        return "cuda"
-
-    if normalized == "mps":
-        if not mps_ok or not mps_has_current:
-            print("[WARN] MPS not available or incomplete. Falling back to CPU.")
-            return "cpu"
-        return "mps"
-
-    if normalized == "cpu":
-        return "cpu"
-
-    print(f"[WARN] Unknown device '{requested}'. Falling back to CPU.")
-    return "cpu"
-
-
-def extract_cam_id(image_name: str) -> str:
-    stem = Path(image_name).stem
-    if stem.startswith("cam"):
-        stem = stem[3:]
-    digits = re.findall(r"\d+", stem)
-    if digits:
-        return digits[0].zfill(4)
-    return stem
-
-
-def camera_intrinsics(camera) -> np.ndarray:
-    model = camera.model
-    params = camera.params
-    if model in {"SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"}:
-        f, cx, cy = params[0], params[1], params[2]
-        fx, fy = f, f
-    elif model in {"PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV", "FOV", "THIN_PRISM_FISHEYE"}:
-        fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+    if PYCOLMAP_API == "new":
+        rec = PyColmapReconstruction()
+        rec.read(colmap_dir)
+        imdata = rec.images
+        cameras_dict = rec.cameras
     else:
-        raise ValueError(f"Unsupported camera model: {model}")
+        manager = SceneManager(colmap_dir)
+        manager.load_cameras()
+        manager.load_images()
+        imdata = manager.images
+        cameras_dict = manager.cameras
 
-    K = np.array(
-        [
-            [fx, 0.0, cx],
-            [0.0, fy, cy],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    return K
+    camera_map = {}
+    for k in imdata:
+        im = imdata[k]
 
+        if PYCOLMAP_API == "new":
+            pose = im.cam_from_world()
+            quat = pose.rotation.quat  # [x, y, z, w]
+            x, y, z, w = quat
+            rot = np.array([
+                [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+                [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+                [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
+            ])
+            trans = np.array(pose.translation).reshape(3, 1)
+        else:
+            rot = im.R()
+            trans = im.tvec.reshape(3, 1)
 
-def build_camera_params(cameras, images, image_scale: float = 1.0) -> Dict[str, Dict[str, np.ndarray]]:
-    params = {}
-    for img in images.values():
-        cam_id = extract_cam_id(img.name)
-        cam = cameras[img.camera_id]
-        K = camera_intrinsics(cam)
-        if image_scale != 1.0:
-            K[:2] *= image_scale
-        R = qvec2rotmat(img.qvec)
-        t = img.tvec.reshape(3, 1)
-        P = K @ np.hstack([R, t])
-        params[cam_id] = {
+        w2c = np.concatenate([np.concatenate([rot, trans], 1), np.array([[0, 0, 0, 1]])], axis=0)
+
+        cam = cameras_dict[im.camera_id]
+        if PYCOLMAP_API == "new":
+            fx = cam.focal_length_x
+            fy = cam.focal_length_y
+            cx = cam.principal_point_x
+            cy = cam.principal_point_y
+            model_name = str(cam.model)
+            cam_params = cam.params
+        else:
+            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+            model_name = str(cam.camera_type)
+            cam_params = []
+
+        if "PINHOLE" in model_name or model_name in ["0", "1"]:
+            params = np.zeros(0, dtype=np.float32)
+        elif "SIMPLE_RADIAL" in model_name or model_name == "2":
+            k1 = cam_params[3] if len(cam_params) > 3 else 0.0
+            params = np.array([k1, 0.0, 0.0, 0.0], dtype=np.float32)
+        elif "RADIAL" in model_name or model_name == "3":
+            k1 = cam_params[3] if len(cam_params) > 3 else 0.0
+            k2 = cam_params[4] if len(cam_params) > 4 else 0.0
+            params = np.array([k1, k2, 0.0, 0.0], dtype=np.float32)
+        elif "OPENCV" in model_name or model_name == "4":
+            k1 = cam_params[4] if len(cam_params) > 4 else 0.0
+            k2 = cam_params[5] if len(cam_params) > 5 else 0.0
+            p1 = cam_params[6] if len(cam_params) > 6 else 0.0
+            p2 = cam_params[7] if len(cam_params) > 7 else 0.0
+            params = np.array([k1, k2, p1, p2], dtype=np.float32)
+        else:
+            params = np.zeros(0, dtype=np.float32)
+
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+
+        name = Path(im.name)
+        cam_name = name.parent.name if ("/" in im.name or "\\" in im.name) else name.stem
+
+        camera_map[cam_name] = {
             "K": K,
-            "R": R,
-            "t": t,
-            "P": P,
-            "width": int(round(cam.width * image_scale)),
-            "height": int(round(cam.height * image_scale)),
+            "w2c": w2c,
+            "dist": params,
         }
-    return params
+
+    return camera_map
 
 
-def find_frame_image(images_dir: Path, cam_id: str, frame_idx: int) -> Optional[Path]:
-    for ext in SUPPORTED_IMAGE_EXTS:
-        candidate = images_dir / f"{cam_id}_frame{frame_idx:06d}{ext}"
-        if candidate.exists():
-            return candidate
+def try_init_roma(device, amp):
+    try:
+        import romatch
+    except Exception:
+        return None
+
+    print(f"[ROMA][DEBUG] romatch module path: {getattr(romatch, '__file__', 'N/A')}")
+    print(f"[ROMA][DEBUG] available attrs: {', '.join([k for k in ['roma_outdoor', 'roma_indoor', 'tiny_roma_v1_outdoor'] if hasattr(romatch, k)])}")
+
+    amp_dtype = torch.float16 if amp else torch.float32
+    if hasattr(romatch, "roma_outdoor"):
+        return romatch.roma_outdoor(device=device, amp_dtype=amp_dtype, symmetric=False)
+    if hasattr(romatch, "roma_indoor"):
+        return romatch.roma_indoor(device=device, amp_dtype=amp_dtype, symmetric=False)
+    if hasattr(romatch, "tiny_roma_v1_outdoor"):
+        return romatch.tiny_roma_v1_outdoor(device=device)
     return None
 
 
-def load_image_rgb(path: Path) -> np.ndarray:
-    with Image.open(path) as image:
-        return np.array(image.convert("RGB"))
+def match_roma(matcher, img0, img1, cert_th=0.3, max_matches=20000):
+    warp, certainty = matcher.match(img0, img1, batched=True)
+
+    if warp.ndim == 4:
+        warp = warp[0]
+    if certainty.ndim == 3:
+        certainty = certainty[0]
+
+    warp = warp.detach().cpu().numpy()
+    certainty = certainty.detach().cpu().numpy()
+
+    h, w, _ = warp.shape
+    flat_warp = warp.reshape(-1, 4)
+    flat_cert = certainty.reshape(-1)
+
+    keep = flat_cert >= cert_th
+    if keep.sum() == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+    pts = flat_warp[keep]
+    scores = flat_cert[keep]
+
+    if len(scores) > max_matches:
+        idx = np.random.choice(len(scores), max_matches, replace=False)
+        pts = pts[idx]
+        scores = scores[idx]
+
+    ax = (pts[:, 0] + 1.0) * 0.5 * (w - 1)
+    ay = (pts[:, 1] + 1.0) * 0.5 * (h - 1)
+    bx = (pts[:, 2] + 1.0) * 0.5 * (w - 1)
+    by = (pts[:, 3] + 1.0) * 0.5 * (h - 1)
+
+    pts0 = np.stack([ax, ay], axis=1).astype(np.float32)
+    pts1 = np.stack([bx, by], axis=1).astype(np.float32)
+    scores = scores.astype(np.float32)
+    return pts0, pts1, scores
 
 
-def resized_image_path(path: Path, scale: float, cache_dir: Path) -> Path:
-    scale_tag = f"s{scale:.3f}".replace(".", "p")
-    return cache_dir / f"{path.stem}_{scale_tag}{path.suffix}"
+def triangulate_pair(K0, w2c0, K1, w2c1, pts0, pts1):
+    P0 = K0 @ w2c0[:3, :]
+    P1 = K1 @ w2c1[:3, :]
+    pts0_h = pts0.T
+    pts1_h = pts1.T
+    X_h = cv2.triangulatePoints(P0, P1, pts0_h, pts1_h)
+    X = (X_h[:3] / X_h[3:4]).T
+    return X
 
 
-def ensure_resized_image(path: Path, scale: float, cache_dir: Path) -> Path:
-    if scale == 1.0:
-        return path
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    resized_path = resized_image_path(path, scale, cache_dir)
-    if resized_path.exists():
-        return resized_path
-    with Image.open(path) as image:
-        image = image.convert("RGB")
-        w, h = image.size
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-        resized = image.resize((new_w, new_h), resample=Image.LANCZOS)
-        resized.save(resized_path)
-    return resized_path
+def sample_colors(img, pts):
+    h, w = img.shape[:2]
+    xs = np.clip(np.round(pts[:, 0]).astype(int), 0, w - 1)
+    ys = np.clip(np.round(pts[:, 1]).astype(int), 0, h - 1)
+    return img[ys, xs, :].astype(np.float32)
 
 
-def sample_colors(image: np.ndarray, points: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
-    xs = np.clip(np.round(points[:, 0]).astype(int), 0, w - 1)
-    ys = np.clip(np.round(points[:, 1]).astype(int), 0, h - 1)
-    return image[ys, xs].astype(np.float32)
-
-
-def triangulate_points(P1: np.ndarray, P2: np.ndarray, pts1: np.ndarray, pts2: np.ndarray) -> np.ndarray:
-    points = np.zeros((len(pts1), 3), dtype=np.float64)
-    for i, (p1, p2) in enumerate(zip(pts1, pts2)):
-        u1, v1 = p1
-        u2, v2 = p2
-        A = np.stack(
-            [
-                u1 * P1[2] - P1[0],
-                v1 * P1[2] - P1[1],
-                u2 * P2[2] - P2[0],
-                v2 * P2[2] - P2[1],
-            ],
-            axis=0,
-        )
-        _, _, vt = np.linalg.svd(A)
-        X = vt[-1]
-        X = X[:3] / X[3]
-        points[i] = X
-    return points
-
-
-def reprojection_error(P: np.ndarray, points3d: np.ndarray, points2d: np.ndarray) -> np.ndarray:
-    homog = np.hstack([points3d, np.ones((len(points3d), 1), dtype=np.float64)])
-    proj = (P @ homog.T).T
-    proj = proj[:, :2] / proj[:, 2:3]
-    return np.linalg.norm(proj - points2d, axis=1)
-
-
-def voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
-    if voxel_size <= 0 or len(points) == 0:
-        return points, colors
-    coords = np.floor(points / voxel_size).astype(np.int64)
-    _, unique_idx = np.unique(coords, axis=0, return_index=True)
-    return points[unique_idx], colors[unique_idx]
-
-
-def maybe_clear_device_cache(device: str) -> None:
-    if device == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    elif device == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
-    gc.collect()
-
-
-def amp_context(device: str, enabled: bool):
-    if not enabled:
-        return nullcontext()
+def format_memory_stats(device: str) -> str:
     if device == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
+        try:
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            return f"CUDA allocated={allocated / (1024 ** 2):.1f}MB, reserved={reserved / (1024 ** 2):.1f}MB"
+        except Exception:
+            return "CUDA memory: N/A"
     if device == "mps":
-        return torch.autocast(device_type="mps", dtype=torch.float16)
-    return nullcontext()
+        try:
+            allocated = torch.mps.current_allocated_memory()
+            reserved = torch.mps.current_reserved_memory()
+            return f"MPS allocated={allocated / (1024 ** 2):.1f}MB, reserved={reserved / (1024 ** 2):.1f}MB"
+        except Exception:
+            return "MPS memory: N/A"
+    return "Device memory: N/A"
 
 
-def main() -> None:
-    args = parse_args()
-    np.random.seed(args.seed)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--images-dir", required=True)
+    parser.add_argument("--colmap-model", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--frame-start", type=int, default=0)
+    parser.add_argument("--frame-end", type=int, default=59)
+    parser.add_argument("--frame-step", type=int, default=1)
+    parser.add_argument("--ref-cam", default="0000")
+    parser.add_argument("--image-ext", default="png")
+    parser.add_argument("--matcher", choices=["roma"], default="roma")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps"], default="auto")
+    parser.add_argument("--certainty", type=float, default=0.3)
+    parser.add_argument("--use-ransac", action="store_true")
+    parser.add_argument("--ransac-th", type=float, default=0.5)
+    parser.add_argument("--min-depth", type=float, default=1e-4)
+    parser.add_argument("--max-matches", type=int, default=20000)
+    parser.add_argument("--voxel-size", type=float, default=0.0)
+    parser.add_argument("--image-scale", type=float, default=1.0)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--cache-dir", default="")
+
+    args = parser.parse_args()
 
     images_dir = Path(args.images_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cameras, images, _ = read_model(args.colmap_model)
-    cam_params = build_camera_params(cameras, images, image_scale=args.image_scale)
+    camera_map = load_colmap_cameras(args.colmap_model)
+    camera_names = sorted(camera_map.keys())
 
-    if args.ref_cam not in cam_params:
-        raise ValueError(f"Reference camera {args.ref_cam} not found in COLMAP model")
+    if args.ref_cam not in camera_map:
+        raise ValueError(f"ref cam not found in COLMAP: {args.ref_cam}")
 
-    if args.roma_model == "roma_outdoor":
-        roma_model = roma_outdoor(device=args.device)
-    else:
-        roma_model = tiny_roma_v1_outdoor(device=args.device)
-    roma_model.sample_mode = args.sample_mode
-    roma_model.sample_thresh = args.sample_thresh
-
-    if args.use_ransac:
-        try:
-            import cv2  # type: ignore
-        except Exception:
-            print("[WARN] OpenCV not available; skipping RANSAC filtering.")
-            cv2 = None
-    else:
-        cv2 = None
-
-    frame_indices = list(range(args.frame_start, args.frame_end + 1, args.frame_step))
-
-    if args.image_scale != 1.0:
-        if args.cache_dir is None:
-            scale_tag = f"s{args.image_scale:.3f}".replace(".", "p")
-            cache_dir = output_dir / f"_roma_cache_{scale_tag}"
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            args.device = "cuda"
+        elif torch.backends.mps.is_available():
+            args.device = "mps"
         else:
-            cache_dir = Path(args.cache_dir)
-        print(f"[INFO] Using image scale {args.image_scale} with cache dir: {cache_dir}")
+            raise RuntimeError("Neither CUDA nor MPS is available. Enable GPU/MPS or set up a supported device.")
     else:
-        cache_dir = None
+        if args.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested but not available. Set --device mps or enable CUDA.")
+        if args.device == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("MPS device requested but not available. Set --device cuda or enable MPS.")
 
-    for frame_idx in frame_indices:
-        ref_path = find_frame_image(images_dir, args.ref_cam, frame_idx)
-        if ref_path is None:
-            print(f"[WARN] Missing reference image for frame {frame_idx:06d}. Skipping.")
+    roma_matcher = try_init_roma(args.device, args.amp)
+    if roma_matcher is None:
+        raise RuntimeError("ROMA is not available. Install romatch and ensure GPU/MPS support is enabled.")
+    print(f"[ROMA] matcher initialized on {args.device}")
+
+    for frame_idx in tqdm(range(args.frame_start, args.frame_end + 1, args.frame_step), desc="Triangulating frames"):
+        ref_path = images_dir / args.ref_cam / f"{frame_idx:06d}.{args.image_ext}"
+        if not ref_path.exists():
+            print(f"[WARN] missing ref frame: {ref_path}")
             continue
 
-        ref_image = None
+        ref_img = cv2.imread(str(ref_path))
+        if ref_img is None:
+            print(f"[WARN] failed to read: {ref_path}")
+            continue
+
+        if args.image_scale != 1.0:
+            ref_img = cv2.resize(ref_img, dsize=None, fx=args.image_scale, fy=args.image_scale)
+
         all_points = []
         all_colors = []
 
-        try:
-            ref_path_scaled = ensure_resized_image(ref_path, args.image_scale, cache_dir) if cache_dir else ref_path
-            ref_image = load_image_rgb(ref_path_scaled)
-            ref_h, ref_w = ref_image.shape[:2]
-
-            for cam_id, params in cam_params.items():
-                if cam_id == args.ref_cam:
-                    continue
-
-                other_path = find_frame_image(images_dir, cam_id, frame_idx)
-                if other_path is None:
-                    continue
-
-                other_path_scaled = ensure_resized_image(other_path, args.image_scale, cache_dir) if cache_dir else other_path
-
-                with torch.inference_mode(), amp_context(args.device, args.amp):
-                    warp, certainty = roma_model.match(str(ref_path_scaled), str(other_path_scaled), device=args.device)
-
-                # Move RoMa outputs to CPU before sampling to minimize VRAM growth across frames.
-                warp = warp.detach().cpu()
-                certainty = certainty.detach().cpu()
-                maybe_clear_device_cache(args.device)
-
-                matches, cert = roma_model.sample(warp, certainty, num=args.max_matches)
-                del warp, certainty
-
-                if matches is None or cert is None or len(matches) == 0:
-                    continue
-
-                cert = cert.squeeze()
-                keep = cert >= args.certainty
-                if keep.sum().item() == 0:
-                    continue
-
-                matches = matches[keep]
-                cert = cert[keep]
-
-                other_image = None
-                try:
-                    other_image = load_image_rgb(other_path_scaled)
-                    other_h, other_w = other_image.shape[:2]
-
-                    kpts_ref, kpts_other = roma_model.to_pixel_coordinates(matches, ref_h, ref_w, other_h, other_w)
-                    kpts_ref = kpts_ref.numpy().astype(np.float64)
-                    kpts_other = kpts_other.numpy().astype(np.float64)
-
-                    if len(kpts_ref) > args.max_matches:
-                        idx = np.random.choice(len(kpts_ref), args.max_matches, replace=False)
-                        kpts_ref = kpts_ref[idx]
-                        kpts_other = kpts_other[idx]
-
-                    if cv2 is not None and args.use_ransac:
-                        F, mask = cv2.findFundamentalMat(
-                            kpts_ref,
-                            kpts_other,
-                            ransacReprojThreshold=args.ransac_th,
-                            method=cv2.USAC_MAGSAC,
-                            confidence=0.999,
-                            maxIters=10000,
-                        )
-                        if mask is not None:
-                            mask = mask.ravel().astype(bool)
-                            kpts_ref = kpts_ref[mask]
-                            kpts_other = kpts_other[mask]
-
-                    if len(kpts_ref) == 0:
-                        continue
-
-                    P1 = cam_params[args.ref_cam]["P"]
-                    P2 = params["P"]
-                    R1, t1 = cam_params[args.ref_cam]["R"], cam_params[args.ref_cam]["t"]
-                    R2, t2 = params["R"], params["t"]
-
-                    points3d = triangulate_points(P1, P2, kpts_ref, kpts_other)
-
-                    z1 = (R1 @ points3d.T + t1).T[:, 2]
-                    z2 = (R2 @ points3d.T + t2).T[:, 2]
-                    depth_mask = (z1 > args.min_depth) & (z2 > args.min_depth)
-
-                    if depth_mask.sum() == 0:
-                        continue
-
-                    points3d = points3d[depth_mask]
-                    kpts_ref = kpts_ref[depth_mask]
-                    kpts_other = kpts_other[depth_mask]
-
-                    err1 = reprojection_error(P1, points3d, kpts_ref)
-                    err2 = reprojection_error(P2, points3d, kpts_other)
-                    reproj_mask = (err1 < args.max_reproj) & (err2 < args.max_reproj)
-
-                    if reproj_mask.sum() == 0:
-                        continue
-
-                    points3d = points3d[reproj_mask]
-                    kpts_ref = kpts_ref[reproj_mask]
-
-                    colors = sample_colors(ref_image, kpts_ref)
-
-                    all_points.append(points3d.astype(np.float32))
-                    all_colors.append(colors.astype(np.float32))
-                    del kpts_ref, kpts_other, points3d, colors
-                finally:
-                    del other_image, matches, cert
-                    maybe_clear_device_cache(args.device)
-
-            if len(all_points) == 0:
-                print(f"[WARN] No points generated for frame {frame_idx:06d}")
+        for cam_name in camera_names:
+            if cam_name == args.ref_cam:
                 continue
 
-            points = np.concatenate(all_points, axis=0)
-            colors = np.concatenate(all_colors, axis=0)
+            other_path = images_dir / cam_name / f"{frame_idx:06d}.{args.image_ext}"
+            if not other_path.exists():
+                continue
 
-            points, colors = voxel_downsample(points, colors, args.voxel_size)
+            other_img = cv2.imread(str(other_path))
+            if other_img is None:
+                continue
 
-            points_path = output_dir / f"points3d_frame{frame_idx:06d}.npy"
-            colors_path = output_dir / f"colors_frame{frame_idx:06d}.npy"
+            if args.image_scale != 1.0:
+                other_img = cv2.resize(other_img, dsize=None, fx=args.image_scale, fy=args.image_scale)
 
-            np.save(points_path, points)
-            np.save(colors_path, colors)
+            ref_pil = Image.fromarray(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB))
+            other_pil = Image.fromarray(cv2.cvtColor(other_img, cv2.COLOR_BGR2RGB))
+            pts0, pts1, scores = match_roma(
+                roma_matcher,
+                ref_pil,
+                other_pil,
+                cert_th=args.certainty,
+                max_matches=args.max_matches,
+            )
+            if len(scores) > 0:
+                keep = scores >= args.certainty
+                pts0, pts1, scores = pts0[keep], pts1[keep], scores[keep]
 
-            print(f"[Frame {frame_idx:06d}] points={len(points)} saved to {output_dir}")
-        finally:
-            del ref_image, all_points, all_colors
-            maybe_clear_device_cache(args.device)
+            if len(pts0) < 8:
+                continue
+
+            if args.use_ransac:
+                F, mask = cv2.findFundamentalMat(pts0, pts1, cv2.FM_RANSAC, args.ransac_th, 0.999)
+                if mask is not None:
+                    mask = mask.squeeze().astype(bool)
+                    pts0 = pts0[mask]
+                    pts1 = pts1[mask]
+
+            if len(pts0) < 8:
+                continue
+
+            # undo image scale for triangulation
+            if args.image_scale != 1.0:
+                pts0 = pts0 / args.image_scale
+                pts1 = pts1 / args.image_scale
+
+            K0 = camera_map[args.ref_cam]["K"]
+            w2c0 = camera_map[args.ref_cam]["w2c"]
+            K1 = camera_map[cam_name]["K"]
+            w2c1 = camera_map[cam_name]["w2c"]
+
+            X = triangulate_pair(K0, w2c0, K1, w2c1, pts0, pts1)
+
+            # depth filter
+            X_h = np.concatenate([X, np.ones((len(X), 1))], axis=1)
+            depth0 = (w2c0 @ X_h.T).T[:, 2]
+            depth1 = (w2c1 @ X_h.T).T[:, 2]
+            valid = (depth0 > args.min_depth) & (depth1 > args.min_depth)
+            X = X[valid]
+            pts0 = pts0[valid]
+
+            if len(X) == 0:
+                continue
+
+            colors = sample_colors(ref_img, pts0)
+            all_points.append(X)
+            all_colors.append(colors)
+
+        if len(all_points) == 0:
+            print(f"[WARN] no points for frame {frame_idx}")
+            continue
+
+        points = np.concatenate(all_points, axis=0).astype(np.float32)
+        colors = np.concatenate(all_colors, axis=0).astype(np.float32)
+
+        if args.voxel_size and args.voxel_size > 0:
+            vox = np.floor(points / args.voxel_size).astype(np.int64)
+            key = vox[:, 0] * 73856093 ^ vox[:, 1] * 19349663 ^ vox[:, 2] * 83492791
+            _, unique_idx = np.unique(key, return_index=True)
+            points = points[unique_idx]
+            colors = colors[unique_idx]
+
+        np.save(output_dir / f"points3d_frame{frame_idx:06d}.npy", points)
+        np.save(output_dir / f"colors_frame{frame_idx:06d}.npy", colors)
+
+        print(f"[Frame {frame_idx:06d}] points={len(points)} | {format_memory_stats(args.device)}")
 
 
 if __name__ == "__main__":
