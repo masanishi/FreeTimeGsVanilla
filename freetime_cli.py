@@ -147,7 +147,7 @@ def step0_configure(args) -> dict:
     if args.data_dir:
         data_dir = Path(args.data_dir).resolve()
     else:
-        default_data = str(PROJECT_ROOT / "dataset" / video_dir.name)
+        default_data = str(PROJECT_ROOT / "dataset" / video_dir.stem)
         raw = Prompt.ask(
             "[bold]データ出力ディレクトリのパスを入力してください[/]",
             default=default_data,
@@ -158,7 +158,7 @@ def step0_configure(args) -> dict:
     if args.result_dir:
         result_dir = Path(args.result_dir).resolve()
     else:
-        default_result = str(PROJECT_ROOT / "results" / video_dir.name)
+        default_result = str(PROJECT_ROOT / "results" / video_dir.stem)
         raw = Prompt.ask(
             "[bold]トレーニング結果の出力先を入力してください[/]",
             default=default_result,
