@@ -2,8 +2,9 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-$(pwd)/dataset/selfcap_dance}"
-CALIB_DIR="${CALIB_DIR:-$DATA_DIR/calib_images}"
-COLMAP_DIR="${COLMAP_DIR:-$DATA_DIR/colmap}"
+# CALIB_DIR, COLMAP_DIR は引数パース後に DATA_DIR から導出する
+_CLI_CALIB_DIR=""
+_CLI_COLMAP_DIR=""
 NUM_CAMERAS="${NUM_CAMERAS:-24}"
 IMAGE_EXT="${IMAGE_EXT:-png}"
 
@@ -18,11 +19,11 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --calib-dir)
-      CALIB_DIR="$2"
+      _CLI_CALIB_DIR="$2"
       shift 2
       ;;
     --colmap-dir)
-      COLMAP_DIR="$2"
+      _CLI_COLMAP_DIR="$2"
       shift 2
       ;;
     --num-cameras)
@@ -44,6 +45,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# --data-dir の更新を反映して派生パスを確定する
+CALIB_DIR="${_CLI_CALIB_DIR:-${CALIB_DIR:-$DATA_DIR/calib_images}}"
+COLMAP_DIR="${_CLI_COLMAP_DIR:-${COLMAP_DIR:-$DATA_DIR/colmap}}"
 
 IMAGES_DIR="$DATA_DIR/images"
 DB_PATH="$COLMAP_DIR/database.db"
