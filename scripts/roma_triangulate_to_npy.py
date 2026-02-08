@@ -8,16 +8,20 @@ RoMa三角測量 → フレームごとのNPYファイル生成スクリプト (
 - マッチ結果から三角測量で3D点群を生成
 - points3d_frame%06d.npy と colors_frame%06d.npy を保存
 
-VRAMリーク対策:
-- 各カメラペア処理後に gc.collect() + empty_cache() を実行
-- 各フレーム処理後にも gc.collect() + empty_cache() を実行
-- これにより PyTorch CUDA キャッシュアロケータのフラグメンテーションを抑制し、
-  60フレーム一括処理でもVRAMが徐々に増大してOOMすることを防ぐ
+VRAMリーク対策 (サブプロセス分離方式):
+- 各フレームを独立したサブプロセスで実行する
+- RoMa/PyTorch/CUDAランタイム内部のメモリリーク
+  (autocastキャッシュ、cuBLASワークスペース、DINOv2隠蔽テンソル、
+   CUDAコンテキスト成長等) はPythonレベルのgc/empty_cacheでは解放不能
+- プロセス終了によりOS/CUDAドライバレベルで全GPUメモリが完全回収される
+- これによりフレームが進んでもVRAMが一定に保たれ、OOMを完全に防ぐ
 """
 
 import argparse
 import gc  # VRAMリーク対策: GC強制実行用
 import os
+import subprocess
+import sys
 from pathlib import Path
 import numpy as np
 import cv2
@@ -46,15 +50,55 @@ def flush_vram(device: str):
     GPUのVRAMキャッシュを強制解放する。
     PyTorchのCUDAアロケータは free されたメモリを再利用のためにキャッシュするが、
     異なるサイズのテンソルが繰り返し確保・解放されるとフラグメンテーションが発生する。
-    gc.collect() でPythonオブジェクトを回収してから empty_cache() でCUDAキャッシュを解放する。
+    synchronize() で非同期GPU操作の完了を待ってから、
+    gc.collect() でPythonオブジェクトを回収し、empty_cache() でCUDAキャッシュを解放する。
     """
     gc.collect()  # Python GCでテンソル参照を確実に解放
     if device == "cuda":
+        torch.cuda.synchronize()  # 非同期GPU操作の完了を待機
+        # autocastが作成するFP16重みキャッシュを強制解放
+        # RoMaはCUDAで常にautocastが有効化されるため、キャッシュが蓄積する
+        if hasattr(torch, 'clear_autocast_cache'):
+            torch.clear_autocast_cache()
         torch.cuda.empty_cache()  # CUDAキャッシュアロケータの未使用メモリを解放
     elif device == "mps":
         # MPS (Apple Silicon GPU) の場合もキャッシュ解放
+        if hasattr(torch.mps, "synchronize"):
+            torch.mps.synchronize()
         if hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
+
+
+def preload_roma_weights_cpu():
+    """
+    RoMaモデルの重みをCPUメモリに一度だけプリロードする。
+
+    フレームごとにmatcherを再作成する際、毎回ディスクI/Oやダウンロードを避けるため、
+    重み (state_dict) をCPUメモリにキャッシュしておく。
+    戻り値: (roma_weights, dinov2_weights) のタプル。利用不可の場合は (None, None)。
+    """
+    try:
+        import romatch
+        from romatch.models.model_zoo import weight_urls
+    except ImportError:
+        return None, None
+
+    roma_url = None
+    if hasattr(romatch, "roma_outdoor"):
+        roma_url = weight_urls["romatch"]["outdoor"]
+    elif hasattr(romatch, "roma_indoor"):
+        roma_url = weight_urls["romatch"]["indoor"]
+
+    dinov2_url = weight_urls.get("dinov2")
+
+    weights = None
+    dinov2_weights = None
+    if roma_url:
+        weights = torch.hub.load_state_dict_from_url(roma_url, map_location="cpu")
+    if dinov2_url:
+        dinov2_weights = torch.hub.load_state_dict_from_url(dinov2_url, map_location="cpu")
+
+    return weights, dinov2_weights
 
 
 def load_colmap_cameras(colmap_dir: str):
@@ -150,21 +194,29 @@ def load_colmap_cameras(colmap_dir: str):
     return camera_map
 
 
-def try_init_roma(device, amp, upsample_preds=True):
+def try_init_roma(device, amp, upsample_preds=True,
+                   preloaded_weights=None, preloaded_dinov2_weights=None,
+                   quiet=False):
     """
     RoMaマッチャーを初期化する。
+
     upsample_preds: Trueの場合、高解像度(864x864)のアップサンプリングpassを追加実行する。
                     Falseの場合、coarse解像度(560x560)のみでVRAMを大幅に削減できる。
+    preloaded_weights: CPUにプリロード済みのRoMa重み (state_dict)。
+                       Noneの場合はtorch.hubから自動ダウンロード。
+    preloaded_dinov2_weights: CPUにプリロード済みのDINOv2重み (state_dict)。
+    quiet: Trueの場合、デバッグ情報の出力を抑制する（フレームループ内での繰り返し出力防止）。
     """
     try:
         import romatch
     except Exception:
         return None  # romatch未インストール
 
-    # デバッグ情報の表示
-    print(f"[ROMA][DEBUG] romatch module path: {getattr(romatch, '__file__', 'N/A')}")
-    print(f"[ROMA][DEBUG] available attrs: {', '.join([k for k in ['roma_outdoor', 'roma_indoor', 'tiny_roma_v1_outdoor'] if hasattr(romatch, k)])}")
-    print(f"[ROMA][DEBUG] upsample_preds={upsample_preds}")
+    # デバッグ情報の表示（初回のみ）
+    if not quiet:
+        print(f"[ROMA][DEBUG] romatch module path: {getattr(romatch, '__file__', 'N/A')}")
+        print(f"[ROMA][DEBUG] available attrs: {', '.join([k for k in ['roma_outdoor', 'roma_indoor', 'tiny_roma_v1_outdoor'] if hasattr(romatch, k)])}")
+        print(f"[ROMA][DEBUG] upsample_preds={upsample_preds}")
 
     # AMP (Automatic Mixed Precision) の精度設定
     amp_dtype = torch.float16 if amp else torch.float32
@@ -176,7 +228,9 @@ def try_init_roma(device, amp, upsample_preds=True):
             device=device,
             amp_dtype=amp_dtype,
             symmetric=False,
-            upsample_preds=upsample_preds,  # VRAMリーク対策: Falseでforward pass半減
+            upsample_preds=upsample_preds,
+            weights=preloaded_weights,
+            dinov2_weights=preloaded_dinov2_weights,
         )
     elif hasattr(romatch, "roma_indoor"):
         # roma_indoor: 屋内シーン向けモデル
@@ -185,6 +239,8 @@ def try_init_roma(device, amp, upsample_preds=True):
             amp_dtype=amp_dtype,
             symmetric=False,
             upsample_preds=upsample_preds,
+            weights=preloaded_weights,
+            dinov2_weights=preloaded_dinov2_weights,
         )
     elif hasattr(romatch, "tiny_roma_v1_outdoor"):
         # tiny_roma: 軽量モデル（DINOv2不使用、upsample_predsパラメータなし）
@@ -215,16 +271,17 @@ def match_roma(matcher, img0, img1, cert_th=0.3, max_matches=20000):
     with torch.inference_mode():
         warp_t, certainty_t = matcher.match(img0, img1, batched=True)
 
-    # バッチ次元を除去（batched=Trueの場合 [1, H, W, 4] → [H, W, 4]）
-    if warp_t.ndim == 4:
-        warp_t = warp_t[0]
-    if certainty_t.ndim == 3:
-        certainty_t = certainty_t[0]
+        # バッチ次元を除去（batched=Trueの場合 [1, H, W, 4] → [H, W, 4]）
+        # inference_mode コンテキスト内で CPU 転送まで完了させる
+        if warp_t.ndim == 4:
+            warp_t = warp_t[0]
+        if certainty_t.ndim == 3:
+            certainty_t = certainty_t[0]
 
-    # GPU → CPU に転送してnumpy配列に変換（GPUテンソルを即座に解放するため）
-    warp = warp_t.detach().cpu().numpy()
-    certainty = certainty_t.detach().cpu().numpy()
-    del warp_t, certainty_t  # GPUテンソルの参照を明示的に解放
+        # GPU → CPU に転送してnumpy配列に変換（GPUテンソルを即座に解放するため）
+        warp = warp_t.detach().cpu().numpy()
+        certainty = certainty_t.detach().cpu().numpy()
+        del warp_t, certainty_t  # GPUテンソルの参照を明示的に解放
 
     # warp map を平坦化: [H, W, 4] → [H*W, 4]  (4 = [ax, ay, bx, by] の正規化座標)
     h, w, _ = warp.shape
@@ -386,8 +443,96 @@ def main():
                              "(解像度 864→560 に下がるがVRAMを大幅に削減)")
     parser.add_argument("--cache-dir", default="",
                         help="モデルキャッシュディレクトリ（未使用）")
+    # 内部用: サブプロセスワーカーモードフラグ（ユーザーは使用しない）
+    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # ==================================================================
+    # サブプロセス分離モード (MASTER / WORKER)
+    # ==================================================================
+    # RoMa + PyTorch + CUDA ランタイムは、match() 呼び出しごとに
+    # Python GC では回収不能な GPU メモリを蓄積する:
+    #   - torch.autocast の FP16 重みキャッシュ (clear_autocast_cache で部分的に解放)
+    #   - cuBLAS / cuDNN ワークスペース (CUDA コンテキスト破棄でのみ解放)
+    #   - DINOv2 ViT の内部バッファ (plain list で隠蔽されており nn.Module.to() で管理不可)
+    #   - CUDA コンテキスト自体の成長 (ドライバレベルのメモリプール)
+    # これらは gc.collect() + empty_cache() + clear_autocast_cache() でも
+    # 完全には解放できず、フレームが進むごとに VRAM 使用量が単調増加し OOM に至る。
+    #
+    # 唯一の確実な解決策: プロセスを終了させて OS / CUDA ドライバに
+    # 全 GPU メモリを回収させること。
+    #
+    # 動作:
+    #   --_worker なし (通常起動 = MASTER):各フレームで自身をサブプロセスとして起動
+    #   --_worker あり (WORKER): 指定フレームを処理して exit (GPU メモリ完全解放)
+    # ==================================================================
+
+    if not args._worker:
+        # ====== MASTER MODE: フレームごとにサブプロセスを起動 ======
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 基本バリデーション（GPU を使わずに実行）
+        if not os.path.isdir(args.colmap_model):
+            raise FileNotFoundError(f"COLMAP model directory not found: {args.colmap_model}")
+        if not os.path.isdir(args.images_dir):
+            raise FileNotFoundError(f"Images directory not found: {args.images_dir}")
+
+        frame_range = list(range(args.frame_start, args.frame_end + 1, args.frame_step))
+        total = len(frame_range)
+        print(f"[MASTER] Subprocess-per-frame mode for complete VRAM isolation")
+        print(f"[MASTER] Frames: {args.frame_start} → {args.frame_end} (step={args.frame_step}, total={total})")
+
+        failed_frames = []
+        for i, frame_idx in enumerate(frame_range):
+            print(f"\n{'='*60}")
+            print(f"[MASTER] Frame {frame_idx:06d}  ({i+1}/{total})")
+            print(f"{'='*60}")
+
+            # 自身を --_worker モードで起動するコマンドを構築
+            cmd = [
+                sys.executable, os.path.abspath(__file__),
+                '--images-dir', str(args.images_dir),
+                '--colmap-model', str(args.colmap_model),
+                '--output-dir', str(args.output_dir),
+                '--frame-start', str(frame_idx),
+                '--frame-end', str(frame_idx),
+                '--frame-step', '1',
+                '--ref-cam', args.ref_cam,
+                '--image-ext', args.image_ext,
+                '--matcher', args.matcher,
+                '--device', args.device,
+                '--certainty', str(args.certainty),
+                '--max-matches', str(args.max_matches),
+                '--min-depth', str(args.min_depth),
+                '--voxel-size', str(args.voxel_size),
+                '--image-scale', str(args.image_scale),
+                '--ransac-th', str(args.ransac_th),
+            ]
+            if args.use_ransac:
+                cmd.append('--use-ransac')
+            if args.amp:
+                cmd.append('--amp')
+            if args.no_upsample:
+                cmd.append('--no-upsample')
+            if args.cache_dir:
+                cmd += ['--cache-dir', args.cache_dir]
+            cmd.append('--_worker')
+
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                print(f"[MASTER][ERROR] Frame {frame_idx:06d} failed (exit code: {result.returncode})")
+                failed_frames.append(frame_idx)
+
+        print(f"\n{'='*60}")
+        if failed_frames:
+            print(f"[MASTER] Completed with {len(failed_frames)} failed frame(s): {failed_frames}")
+        else:
+            print(f"[MASTER] All {total} frames completed successfully.")
+        return
+
+    # ====== WORKER MODE: 単一フレーム（またはフレーム範囲）を処理 ======
 
     # --- パスの準備 ---
     images_dir = Path(args.images_dir)
@@ -422,13 +567,26 @@ def main():
         print("[NOTICE] Setting PYTORCH_ENABLE_MPS_FALLBACK=1 to enable CPU fallback for unsupported MPS ops.")
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-    # --- RoMaマッチャーの初期化 ---
-    # upsample_preds: Trueなら高解像度(864)、Falseなら低解像度(560)でVRAM削減
+    # --- RoMaモデル重みのプリロード ---
+    # VRAMリーク対策: フレームごとにmatcherを再作成するため、
+    # 重みをCPUメモリにキャッシュしておく（ディスクI/O・ダウンロードの回避）
     upsample_preds = not args.no_upsample
-    roma_matcher = try_init_roma(args.device, args.amp, upsample_preds=upsample_preds)
+    print("[ROMA] Pre-loading model weights to CPU...")
+    roma_weights_cpu, dinov2_weights_cpu = preload_roma_weights_cpu()
+
+    # 初回のmatcher作成（利用可能性チェック + デバッグ情報表示用）
+    roma_matcher = try_init_roma(
+        args.device, args.amp, upsample_preds=upsample_preds,
+        preloaded_weights=roma_weights_cpu,
+        preloaded_dinov2_weights=dinov2_weights_cpu,
+        quiet=False,
+    )
     if roma_matcher is None:
         raise RuntimeError("ROMA is not available. Install romatch and ensure GPU/MPS support is enabled.")
     print(f"[ROMA] matcher initialized on {args.device} (upsample_preds={upsample_preds})")
+    # 初回matcherは即座に解放（フレームループ内で再作成する）
+    del roma_matcher
+    flush_vram(args.device)
 
     # --- フレームごとの三角測量ループ ---
     for frame_idx in tqdm(range(args.frame_start, args.frame_end + 1, args.frame_step), desc="Triangulating frames"):
@@ -437,6 +595,20 @@ def main():
         # （フレーム単位でのピークVRAM追跡用）
         if args.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
+
+        # VRAMリーク対策: フレームごとにmatcherを新規作成する。
+        # RoMaのmatch()呼び出しで蓄積される内部GPUテンソル（autocastキャッシュ、
+        # 特徴マップ、DINOv2内部状態等）を確実に解放するため、フレーム終了時に
+        # matcherオブジェクトを破棄してVRAMを完全にクリーンにする。
+        # CPUにプリロードした重みから再作成するため、追加のディスクI/Oは発生しない。
+        roma_matcher = try_init_roma(
+            args.device, args.amp, upsample_preds=upsample_preds,
+            preloaded_weights=roma_weights_cpu,
+            preloaded_dinov2_weights=dinov2_weights_cpu,
+            quiet=True,
+        )
+        if roma_matcher is None:
+            raise RuntimeError("ROMA matcher creation failed.")
 
         # リファレンスカメラの画像パスを構築
         ref_path = images_dir / args.ref_cam / f"{frame_idx:06d}.{args.image_ext}"
@@ -461,6 +633,10 @@ def main():
         all_points = []  # このフレームの全3D点を集約するリスト
         all_colors = []  # このフレームの全RGB色を集約するリスト
 
+        # ref_pil をフレームごとに1回だけ生成（カメラペアループの外）
+        # ref_img は既にスケーリング済み（image_scale != 1.0 の場合）
+        ref_pil = Image.fromarray(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB))
+
         # --- カメラペアループ: refカメラ × 他の全カメラ ---
         for cam_name in camera_names:
             # リファレンスカメラ自身はスキップ
@@ -482,7 +658,6 @@ def main():
                 other_img = cv2.resize(other_img, dsize=None, fx=args.image_scale, fy=args.image_scale)
 
             # OpenCV BGR → PIL RGB に変換（RoMaの入力形式）
-            ref_pil = Image.fromarray(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB))
             other_pil = Image.fromarray(cv2.cvtColor(other_img, cv2.COLOR_BGR2RGB))
 
             # RoMaマッチング: 2画像間の対応点を検出
@@ -502,7 +677,7 @@ def main():
             # マッチ数が最低限（8点: 基礎行列推定に必要）に満たない場合はスキップ
             if len(pts0) < 8:
                 # VRAMリーク対策: スキップ前にもGPUキャッシュを解放
-                del other_img, other_pil, ref_pil
+                del other_img, other_pil
                 flush_vram(args.device)
                 continue
 
@@ -517,7 +692,7 @@ def main():
 
             # RANSAC後もマッチ数チェック
             if len(pts0) < 8:
-                del other_img, other_pil, ref_pil
+                del other_img, other_pil
                 flush_vram(args.device)
                 continue
 
@@ -547,7 +722,7 @@ def main():
 
             if len(X) == 0:
                 # 有効点なし → スキップ
-                del other_img, other_pil, ref_pil
+                del other_img, other_pil
                 flush_vram(args.device)
                 continue
 
@@ -557,7 +732,7 @@ def main():
             all_colors.append(colors)  # RGB色を集約リストに追加
 
             # このカメラペアで使用した変数を明示的に解放
-            del other_img, other_pil, ref_pil, pts0, pts1, scores, X, colors
+            del other_img, other_pil, pts0, pts1, scores, X, colors
 
             # VRAMリーク対策: 各カメラペア処理後にGPUキャッシュを強制解放
             # PyTorchのCUDAアロケータはfreeされたメモリを再利用のためにキャッシュするが、
@@ -593,11 +768,14 @@ def main():
         print(f"[Frame {frame_idx:06d}] points={len(points)} | {format_memory_stats(args.device)}")
 
         # このフレームで使用した変数を明示的に解放
-        del points, colors, all_points, all_colors, ref_img, ref_img_rgb
+        del points, colors, all_points, all_colors, ref_img, ref_img_rgb, ref_pil
 
-        # VRAMリーク対策: フレーム処理完了後にもGPUキャッシュを強制解放
-        # カメラペアループ内で毎回 flush しているが、フレーム末尾でも追加で flush する。
-        # これにより次フレーム開始時にはVRAMがクリーンな状態に戻る。
+        # VRAMリーク対策（核心部分）: matcherオブジェクトを破棄してGPUメモリを完全解放。
+        # RoMaのmatch()は内部でautocast FP16キャッシュ、CUDAワークスペース、
+        # DINOv2の隠蔽されたGPUテンソル等を蓄積する。これらはgc.collect() +
+        # empty_cache()だけでは解放できないため、matcherオブジェクト自体を破棄し、
+        # 次フレームで新規作成することでVRAMを確実にクリーンな状態に戻す。
+        del roma_matcher
         flush_vram(args.device)
 
 

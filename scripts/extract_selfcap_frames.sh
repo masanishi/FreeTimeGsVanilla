@@ -9,12 +9,13 @@ VIDEO_DIR="${VIDEO_DIR:-$(pwd)/dance}"     # 入力動画ディレクトリ
 OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/dataset/selfcap_dance/images}"  # 出力画像ディレクトリ
 NUM_CAMERAS="${NUM_CAMERAS:-24}"           # カメラ台数
 NUM_FRAMES="${NUM_FRAMES:-60}"            # 抽出フレーム数
+START_FRAME="${START_FRAME:-0}"           # 抽出開始フレーム番号（0=先頭から）
 RESIZE_SCALE="${RESIZE_SCALE:-1}"         # リサイズ倍率（1=4K原寸維持）
 FPS="${FPS:-60}"                          # 抽出FPS（元動画のFPSに依存せず指定FPSで抽出）
 
 # --- ヘルプ表示 ---
 usage() {
-  echo "Usage: $0 [--video-dir PATH] [--output-dir PATH] [--num-cameras N] [--num-frames N] [--resize-scale S] [--fps N]"
+  echo "Usage: $0 [--video-dir PATH] [--output-dir PATH] [--num-cameras N] [--num-frames N] [--start-frame N] [--resize-scale S] [--fps N]"
 }
 
 # --- コマンドライン引数のパース ---
@@ -34,6 +35,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --num-frames)
       NUM_FRAMES="$2"   # 各カメラから抽出するフレーム数
+      shift 2
+      ;;
+    --start-frame)
+      START_FRAME="$2"  # 抽出開始フレーム番号（0=先頭）
       shift 2
       ;;
     --resize-scale)
@@ -79,9 +84,22 @@ echo "==> Extracting frames"
 echo "  Video dir: $VIDEO_DIR"
 echo "  Output dir: $OUTPUT_DIR"
 echo "  Cameras: $NUM_CAMERAS"
+echo "  Start frame: $START_FRAME"
 echo "  Frames: $NUM_FRAMES"
 echo "  FPS: $FPS"
 echo "  Resize scale: $RESIZE_SCALE"
+
+# --- 開始フレームからシーク時間を計算 ---
+# START_FRAME > 0 の場合、ffmpegの -ss でその位置までシークする
+# 計算: start_frame / fps = 秒数
+if [[ "$START_FRAME" -gt 0 ]]; then
+  # bcで浮動小数点計算（zsh/bash両対応）
+  SEEK_SECONDS=$(echo "scale=6; $START_FRAME / $FPS" | bc)
+  SEEK_OPT="-ss $SEEK_SECONDS"
+  echo "  Seek: ${SEEK_SECONDS}s (frame $START_FRAME at ${FPS}fps)"
+else
+  SEEK_OPT=""
+fi
 
 # --- カメラごとのフレーム抽出ループ ---
 for ((i=0; i<NUM_CAMERAS; i++)); do
@@ -109,12 +127,15 @@ for ((i=0; i<NUM_CAMERAS; i++)); do
 
   # --- ffmpegでフレーム抽出 ---
   # -y: 上書き許可
+  # -ss: 開始位置へシーク（START_FRAME > 0 の場合のみ）
   # -i: 入力動画
   # -vf "fps=N[,scale=...]": ビデオフィルタ（FPS指定 + オプションのリサイズ）
   # -frames:v N: 最大N枚のフレームを出力
   # -vsync 0: タイムスタンプ変換なし（フレーム落ちを防ぐ）
-  # -start_number 0: 出力ファイルのナンバリングを0始まりに
+  # -start_number 0: 出力ファイルのナンバリングを0始まりに（ローカル番号）
+  # shellcheck disable=SC2086
   ffmpeg -y \
+    $SEEK_OPT \
     -i "$video_path" \
     -vf "$VF_FILTERS" \
     -frames:v "$NUM_FRAMES" \

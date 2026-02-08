@@ -166,6 +166,7 @@ def step0_configure(args) -> dict:
         result_dir = Path(raw).resolve()
 
     # --- フレーム数 / FPS ---
+    start_frame = args.start_frame or 0
     num_frames = args.num_frames or 60
     fps = args.fps or 60
     keyframe_step = args.keyframe_step or 5
@@ -180,6 +181,7 @@ def step0_configure(args) -> dict:
     summary.add_row("カメラ台数", str(num_cameras))
     summary.add_row("データ出力先", str(data_dir))
     summary.add_row("結果出力先", str(result_dir))
+    summary.add_row("開始フレーム", str(start_frame))
     summary.add_row("フレーム数", str(num_frames))
     summary.add_row("FPS", str(fps))
     summary.add_row("キーフレーム間隔", str(keyframe_step))
@@ -197,6 +199,7 @@ def step0_configure(args) -> dict:
         "data_dir": data_dir,
         "result_dir": result_dir,
         "num_cameras": num_cameras,
+        "start_frame": start_frame,
         "num_frames": num_frames,
         "fps": fps,
         "keyframe_step": keyframe_step,
@@ -255,6 +258,7 @@ def step1_extract_frames(cfg: dict) -> str:
         "--output-dir", str(images_dir),
         "--num-cameras", str(num_cameras),
         "--num-frames", str(num_frames),
+        "--start-frame", str(cfg["start_frame"]),
         "--fps", str(cfg["fps"]),
     ])
     if rc != 0:
@@ -382,7 +386,8 @@ def step4_combine(cfg: dict) -> tuple[str, Path]:
     num_frames = cfg["num_frames"]
     keyframe_step = cfg["keyframe_step"]
     triangulation_dir = cfg["data_dir"] / "triangulation"
-    npz_path = cfg["data_dir"] / f"keyframes_{num_frames}frames_step{keyframe_step}.npz"
+    start_frame = cfg["start_frame"]
+    npz_path = cfg["data_dir"] / f"keyframes_{num_frames}frames_start{start_frame}_step{keyframe_step}.npz"
 
     if npz_path.exists():
         size_mb = npz_path.stat().st_size / (1024 * 1024)
@@ -571,6 +576,8 @@ def parse_args():
                         help="トレーニング結果の出力先（省略時は対話で入力）")
     parser.add_argument("--gpu-id", type=int, default=0,
                         help="使用するGPU ID (default: 0)")
+    parser.add_argument("--start-frame", type=int, default=None,
+                        help="動画の抽出開始フレーム番号 (default: 0)。例: --start-frame 60 で61番目のフレームから抽出")
     parser.add_argument("--num-frames", type=int, default=None,
                         help="抽出フレーム数 (default: 60)")
     parser.add_argument("--fps", type=int, default=None,
