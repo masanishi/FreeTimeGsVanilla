@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FreeTimeGS 4D Viewer</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <canvas id="application-canvas"></canvas>
+
+  <!-- Controls overlay -->
+  <div id="controls">
+    <button id="btn-play" title="再生/停止">▶</button>
+    <input id="seekbar" type="range" min="0" max="59" step="1" value="0" />
+    <span id="frame-label">0 / 59</span>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settings-panel">
+    <details open>
+      <summary>設定</summary>
+      <label>
+        カメラ:
+        <select id="camera-preset">
+          <option value="">自由視点</option>
+        </select>
+      </label>
+      <label>
+        Temporal Threshold: <span id="threshold-value">0.01</span>
+        <input id="threshold-slider" type="range" min="0" max="0.5" step="0.005" value="0.01" />
+      </label>
+      <label>
+        再生FPS: <span id="fps-value">30</span>
+        <input id="fps-slider" type="range" min="1" max="60" step="1" value="30" />
+      </label>
+      <label>
+        Max Splat Scale: <span id="scale-value">0.300</span>
+        <input id="scale-slider" type="range" min="0.01" max="1.0" step="0.005" value="0.3" />
+      </label>
+      <label>
+        Max Displacement: <span id="disp-value">5.000</span>
+        <input id="disp-slider" type="range" min="0.1" max="20.0" step="0.1" value="5.0" />
+      </label>
+      <label class="checkbox-label">
+        <input id="enable-disp-checkbox" type="checkbox" checked />
+        Displacement有効
+      </label>
+      <label>
+        デバッグ表示:
+        <select id="debug-mode-select">
+          <option value="0">通常</option>
+          <option value="1">Temporal Opacity</option>
+          <option value="2">Displacement量</option>
+        </select>
+      </label>
+      <label>
+        Alpha Mode:
+        <select id="alpha-mode-select">
+          <option value="0" selected>Full modulation</option>
+          <option value="1">Binary (no fade)</option>
+          <option value="2">Sqrt (gentle)</option>
+        </select>
+      </label>
+      <label>
+        Max Aspect Ratio: <span id="aspect-value">50.0</span>
+        <input id="aspect-slider" type="range" min="0" max="200" step="1" value="50" />
+      </label>
+      <label>
+        背景色:
+        <select id="bg-color-select">
+          <option value="white" selected>白</option>
+          <option value="black">黒</option>
+          <option value="gray">グレー</option>
+        </select>
+      </label>
+      <button id="btn-reset" style="margin-top:6px;width:100%;padding:4px 8px;background:rgba(255,255,255,0.12);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;cursor:pointer;font-size:12px;">設定リセット</button>
+    </details>
+  </div>
+
+  <!-- Debug panel -->
+  <div id="debug-panel">
+    <div>FPS: <span id="dbg-fps">--</span></div>
+    <div>Splats: <span id="dbg-splats">--</span></div>
+    <div>Frame: <span id="dbg-frame">0 / 59</span></div>
+    <div>Time: <span id="dbg-time">0.000</span></div>
+  </div>
+
+  <!-- Loading overlay -->
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <p id="loading-text">読み込み中…</p>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

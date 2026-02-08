@@ -8,4 +8,4 @@ uv pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_con
 
 uv sync --no-build-isolation
 
-uv pip install romatch[fused-local-corr]
+uv pip install romatch[fused-local-corr] rich
