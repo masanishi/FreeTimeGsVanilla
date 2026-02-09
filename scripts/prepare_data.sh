@@ -1,5 +1,5 @@
 #!/bin/bash
-# SelfCap Dance データ準備パイプライン
+# データ準備パイプライン
 # 4つのステップを順に実行する:
 #   1. フレーム抽出（MP4 → PNG）
 #   2. COLMAPキャリブレーション（カメラ内部/外部パラメータ推定）
@@ -12,8 +12,8 @@ set -euo pipefail
 # ===========================
 
 # --- 基本パラメータ ---
-VIDEO_DIR="${VIDEO_DIR:-$(pwd)/dance}"                # 入力動画ディレクトリ（CCCC.mp4）
-DATA_DIR="${DATA_DIR:-$(pwd)/dataset/selfcap_dance}"  # データ出力ルート
+VIDEO_DIR="${VIDEO_DIR:-$(pwd)/movies/dance}"       # 入力動画ディレクトリ（0000.mp4, 0001.mp4, ...）
+DATA_DIR="${DATA_DIR:-$(pwd)/dataset/dance}"        # データ出力ルート
 NUM_CAMERAS="${NUM_CAMERAS:-24}"    # カメラ台数
 NUM_FRAMES="${NUM_FRAMES:-60}"     # フレーム数（60fps前提で1秒分）
 FPS="${FPS:-60}"                   # 抽出FPS（4K 60fps動画からの抽出を想定）
@@ -152,7 +152,7 @@ mkdir -p "$DATA_DIR"
 # ===========================
 if [[ $SKIP_EXTRACT -eq 0 ]]; then
   echo "==> Extracting frames (run inside tmux recommended)"
-  bash scripts/extract_selfcap_frames.sh \
+  bash scripts/extract_frames.sh \
     --video-dir "$VIDEO_DIR" \
     --output-dir "$IMAGES_DIR" \
     --num-cameras "$NUM_CAMERAS" \

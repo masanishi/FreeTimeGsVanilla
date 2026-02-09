@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-$(pwd)/dataset/selfcap_dance}"
+DATA_DIR="${DATA_DIR:-$(pwd)/dataset/dance}"
 # CALIB_DIR, COLMAP_DIR は引数パース後に DATA_DIR から導出する
 _CLI_CALIB_DIR=""
 _CLI_COLMAP_DIR=""

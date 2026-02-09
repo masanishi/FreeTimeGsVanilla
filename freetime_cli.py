@@ -5,15 +5,20 @@ FreeTimeGS 対話型パイプラインCLI
 動画 → フレーム抽出 → COLMAP → RoMa三角測量 → キーフレーム結合 → トレーニング
 の全ステップを対話的にガイドする。
 
+動画データは movies/<シーン名>/ に配置する。
+ファイル名: 0000.mp4, 0001.mp4, ... （4桁ゼロ埋め連番）
+成果物は dataset/<シーン名>/ に出力される。
+
 Usage:
     python freetime_cli.py
-    python freetime_cli.py --video-dir ./dance --data-dir ./dataset/my_scene
+    python freetime_cli.py --video-dir ./movies/dance --data-dir ./dataset/dance
     python freetime_cli.py --yes          # 全プロンプトに自動応答（CI向け）
     python freetime_cli.py --gpu-id 2     # GPU IDを指定
 """
 
 import argparse
 import glob
+import re
 import os
 import shutil
 import subprocess
@@ -72,7 +77,7 @@ def run_cmd(cmd: list[str], env: dict | None = None, cwd: str | None = None) -> 
     if env:
         merged_env.update(env)
 
-    console.print(f"[dim]$ {' '.join(str(c) for c in cmd)}[/]")
+    console.print(f"$ {' '.join(str(c) for c in cmd)}")
     console.print()
 
     proc = subprocess.Popen(
@@ -84,7 +89,7 @@ def run_cmd(cmd: list[str], env: dict | None = None, cwd: str | None = None) -> 
         cwd=cwd or str(PROJECT_ROOT),
     )
     for line in proc.stdout:
-        console.print(f"  [dim]{line.rstrip()}[/]")
+        console.print(f"  {line.rstrip()}")
     proc.wait()
     return proc.returncode
 
@@ -104,6 +109,62 @@ def fail_and_exit(step: str, returncode: int):
 
 
 # ============================================================
+# 動画バリデーション
+# ============================================================
+def validate_video_files(video_dir: Path) -> int:
+    """
+    動画ディレクトリ内のMP4ファイルを検証する。
+
+    検証内容:
+      - ファイル名が4桁数字.mp4 (0000.mp4, 0001.mp4, ...) であること
+      - 0000から始まる連番であること（歯抜けなし）
+    戻り値: カメラ台数（= MP4ファイル数）
+    """
+    mp4_files = sorted(video_dir.glob("*.mp4"))
+    if not mp4_files:
+        console.print(f"[red]エラー: {video_dir} に .mp4 ファイルがありません[/]")
+        sys.exit(1)
+
+    # 検証1: ファイル名が4桁数字.mp4 であること
+    pattern = re.compile(r"^\d{4}$")
+    invalid_files = []
+    for f in mp4_files:
+        stem = f.stem
+        if not pattern.match(stem):
+            invalid_files.append(f.name)
+
+    if invalid_files:
+        console.print("[red bold]✖ 不正なファイル名が見つかりました（4桁数字.mp4 が必要です）:[/]")
+        for name in invalid_files:
+            console.print(f"  [red]- {name}[/]")
+        console.print("[yellow]正しい命名例: 0000.mp4, 0001.mp4, 0002.mp4, ...[/]")
+        sys.exit(1)
+
+    # 検証2: 0000からの連番であること
+    numbers = sorted(int(f.stem) for f in mp4_files)
+    expected = list(range(len(numbers)))
+    if numbers != expected:
+        missing = set(expected) - set(numbers)
+        existing_str = ", ".join(f"{n:04d}.mp4" for n in numbers[:10])
+        if len(numbers) > 10:
+            existing_str += ", ..."
+        console.print("[red bold]✖ 動画ファイルの連番に問題があります:[/]")
+        console.print(f"  [yellow]存在: {existing_str}[/]")
+        if missing:
+            missing_str = ", ".join(f"{n:04d}.mp4" for n in sorted(missing)[:10])
+            if len(missing) > 10:
+                missing_str += ", ..."
+            console.print(f"  [red]欠番: {missing_str}[/]")
+        else:
+            console.print(f"  [red]連番が0000から始まっていません。先頭は {numbers[0]:04d}.mp4 です。[/]")
+        console.print("[yellow]動画ファイルは 0000.mp4 からの連番で配置してください。[/]")
+        sys.exit(1)
+
+    num_cameras = len(mp4_files)
+    return num_cameras
+
+
+# ============================================================
 # Step 0: 動画ディレクトリとパラメータの設定
 # ============================================================
 def step0_configure(args) -> dict:
@@ -112,26 +173,71 @@ def step0_configure(args) -> dict:
 
     # --- 動画ディレクトリ ---
     if args.video_dir:
+        # --video-dir 指定時はそのパスを直接使用（後方互換）
         video_dir = Path(args.video_dir).resolve()
+        if not video_dir.exists():
+            console.print(f"[red]エラー: ディレクトリが見つかりません: {video_dir}[/]")
+            sys.exit(1)
     else:
-        raw = Prompt.ask(
-            "[bold]動画ディレクトリのパスを入力してください[/]",
-            default=str(PROJECT_ROOT / "dance"),
-        )
-        video_dir = Path(raw).resolve()
+        # movies/ フォルダからシーンを選択
+        movies_dir = PROJECT_ROOT / "movies"
+        if not movies_dir.exists():
+            console.print(
+                "[red]エラー: movies/ フォルダが見つかりません[/]\n"
+                "[yellow]動画データを以下の形式で配置してください:[/]\n"
+                "  movies/<シーン名>/0000.mp4, 0001.mp4, ...\n"
+                "  例: movies/dance/0000.mp4"
+            )
+            sys.exit(1)
 
-    if not video_dir.exists():
-        console.print(f"[red]エラー: ディレクトリが見つかりません: {video_dir}[/]")
-        sys.exit(1)
+        # サブフォルダを列挙（MP4を含むフォルダのみ）
+        scene_dirs = sorted([
+            d for d in movies_dir.iterdir()
+            if d.is_dir() and list(d.glob("*.mp4"))
+        ])
+        if not scene_dirs:
+            console.print(
+                "[red]エラー: movies/ のMP4動画を含むサブフォルダがありません[/]\n"
+                "[yellow]動画データを以下の形式で配置してください:[/]\n"
+                "  movies/<シーン名>/0000.mp4, 0001.mp4, ...\n"
+                "  例: movies/dance/0000.mp4"
+            )
+            sys.exit(1)
 
-    # mp4 ファイルを列挙
+        # シーン一覧テーブルを表示
+        table = Table(title="検出されたシーン (movies/)", border_style="bright_blue")
+        table.add_column("#", width=4)
+        table.add_column("シーン名", style="cyan")
+        table.add_column("MP4ファイル数", justify="right", style="green")
+        table.add_column("合計サイズ", justify="right", style="green")
+        for i, d in enumerate(scene_dirs):
+            mp4s = list(d.glob("*.mp4"))
+            total_size = sum(f.stat().st_size for f in mp4s) / (1024 * 1024)
+            table.add_row(str(i), d.name, str(len(mp4s)), f"{total_size:.0f} MB")
+        console.print(table)
+        console.print()
+
+        if len(scene_dirs) == 1:
+            # 1つだけなら自動選択
+            video_dir = scene_dirs[0]
+            console.print(f"[bold]シーンを自動選択:[/] [bright_green]{video_dir.name}[/]")
+        else:
+            idx = IntPrompt.ask(
+                "[bold]シーン番号を選択してください[/]",
+                default=0,
+            )
+            if idx < 0 or idx >= len(scene_dirs):
+                console.print(f"[red]エラー: 無効な番号です: {idx}[/]")
+                sys.exit(1)
+            video_dir = scene_dirs[idx]
+
+    # --- 動画ファイルのバリデーション & カメラ台数自動検出 ---
+    num_cameras = validate_video_files(video_dir)
+
+    # 動画ファイル一覧を表示
     mp4_files = sorted(video_dir.glob("*.mp4"))
-    if not mp4_files:
-        console.print(f"[red]エラー: {video_dir} に .mp4 ファイルがありません[/]")
-        sys.exit(1)
-
     table = Table(title="検出された動画ファイル", border_style="bright_blue")
-    table.add_column("#", style="dim", width=4)
+    table.add_column("#", width=4)
     table.add_column("ファイル名", style="cyan")
     table.add_column("サイズ", justify="right", style="green")
     for i, f in enumerate(mp4_files):
@@ -139,15 +245,13 @@ def step0_configure(args) -> dict:
         table.add_row(str(i), f.name, f"{size_mb:.1f} MB")
     console.print(table)
     console.print()
-
-    num_cameras = len(mp4_files)
-    console.print(f"[bold]カメラ台数:[/] [bright_green]{num_cameras}[/]")
+    console.print(f"[bold]カメラ台数:[/] [bright_green]{num_cameras}[/] （自動検出）")
 
     # --- データ出力ディレクトリ ---
     if args.data_dir:
         data_dir = Path(args.data_dir).resolve()
     else:
-        default_data = str(PROJECT_ROOT / "dataset" / video_dir.stem)
+        default_data = str(PROJECT_ROOT / "dataset" / video_dir.name)
         raw = Prompt.ask(
             "[bold]データ出力ディレクトリのパスを入力してください[/]",
             default=default_data,
@@ -158,7 +262,7 @@ def step0_configure(args) -> dict:
     if args.result_dir:
         result_dir = Path(args.result_dir).resolve()
     else:
-        default_result = str(PROJECT_ROOT / "results" / video_dir.stem)
+        default_result = str(PROJECT_ROOT / "results" / video_dir.name)
         raw = Prompt.ask(
             "[bold]トレーニング結果の出力先を入力してください[/]",
             default=default_result,
@@ -246,14 +350,14 @@ def step1_extract_frames(cfg: dict) -> str:
             f"[yellow]{existing_count}/{num_cameras} カメラのフレームが部分的に存在します[/]"
         )
         if confirm("既存分を活かして不足分のみ抽出しますか？（Noで全削除して再抽出）", cfg["auto_yes"]):
-            pass  # 既存はそのままで extract_selfcap_frames.sh 側のスキップ機能に任せる
+            pass  # 既存はそのままで extract_frames.sh 側のスキップ機能に任せる
         else:
             console.print("[yellow]既存フレームを削除して再抽出します...[/]")
             shutil.rmtree(images_dir)
 
     console.print(STEP_STYLES["run"])
     rc = run_cmd([
-        "bash", "scripts/extract_selfcap_frames.sh",
+        "bash", "scripts/extract_frames.sh",
         "--video-dir", str(cfg["video_dir"]),
         "--output-dir", str(images_dir),
         "--num-cameras", str(num_cameras),
@@ -415,14 +519,9 @@ def step4_combine(cfg: dict) -> tuple[str, Path]:
             console.print(STEP_STYLES["skip"])
             return "skip", npz_path
 
-        # 再生成: NPZ と NPY 両方を削除
-        console.print("[yellow]既存のNPZとNPYを削除して再生成します...[/]")
+        # 再生成: NPZのみ削除（NPYは保持して再結合）
+        console.print("[yellow]既存のNPZを削除して再生成します...[/]")
         npz_path.unlink()
-        if triangulation_dir.exists():
-            shutil.rmtree(triangulation_dir)
-        # NPYを再生成するため RoMa ステップを再実行
-        console.print("[yellow]NPYが削除されたため、RoMa 三角測量を再実行します...[/]")
-        step3_roma(cfg)
 
     console.print(STEP_STYLES["run"])
     rc = run_cmd([
@@ -564,7 +663,7 @@ def parse_args():
         epilog=(
             "例:\n"
             "  python freetime_cli.py\n"
-            "  python freetime_cli.py --video-dir ./dance --data-dir ./dataset/dance\n"
+            "  python freetime_cli.py --video-dir ./movies/dance --data-dir ./dataset/dance\n"
             "  python freetime_cli.py --yes --gpu-id 0\n"
         ),
     )

@@ -5,11 +5,25 @@ Outputs:
 - canonical.ply: canonical 3DGS splats (static parameters)
 - canonical.sog: optional SOG v2 bundle (when --sog is specified)
 - params_4d.bin: custom binary with velocities, times, durations
+- scene_meta.json: scene metadata, camera presets, viewer params
 
 Usage:
+    # Basic (no camera presets):
+    python scripts/convert_ckpt_to_web.py \
+        --ckpt results/freetime_4d/ckpts/ckpt_29999.pt \
+        --output-dir web-viewer/public/data
+
+    # With COLMAP cameras → lookatCenter + camera presets (recommended):
     python scripts/convert_ckpt_to_web.py \
         --ckpt results/freetime_4d/ckpts/ckpt_29999.pt \
         --output-dir web-viewer/public/data \
+        --colmap-dir dataset/dance/colmap/sparse/0
+
+    # With SOG compression:
+    python scripts/convert_ckpt_to_web.py \
+        --ckpt results/freetime_4d/ckpts/ckpt_29999.pt \
+        --output-dir web-viewer/public/data \
+        --colmap-dir dataset/dance/colmap/sparse/0 \
         --sog
 """
 
@@ -21,11 +35,15 @@ import shlex
 import shutil
 import struct
 import subprocess
+import sys
 from typing import List, Tuple
 
 import numpy as np
 import torch
 from gsplat.exporter import export_splats
+
+# Add project root to path for datasets module
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def compute_spatial_mask(
@@ -92,6 +110,148 @@ def compute_temporal_visibility_mask(
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+# ─── Camera utilities (from traj.py / FreeTime_dataset.py) ───────────────────
+
+def _normalize(x: np.ndarray) -> np.ndarray:
+    return x / np.linalg.norm(x)
+
+
+def focus_point_fn(poses: np.ndarray) -> np.ndarray:
+    """Calculate nearest point to all focal axes in poses (from traj.py).
+
+    This gives a much better "look-at" target than simple centroid of Gaussians.
+    """
+    directions, origins = poses[:, :3, 2:3], poses[:, :3, 3:4]
+    m = np.eye(3) - directions * np.transpose(directions, [0, 2, 1])
+    mt_m = np.transpose(m, [0, 2, 1]) @ m
+    focus_pt = np.linalg.inv(mt_m.mean(0)) @ (mt_m @ origins).mean(0)[:, 0]
+    return focus_pt
+
+
+def load_colmap_cameras(colmap_dir: str) -> Tuple[np.ndarray, np.ndarray, List[dict], np.ndarray]:
+    """Load camera poses and intrinsics from COLMAP sparse model.
+
+    Returns:
+        camtoworlds: [N, 4, 4] camera-to-world matrices (normalized to match training space)
+        Ks: [N, 3, 3] intrinsic matrices (first camera shared)
+        camera_info: list of dicts with name, width, height, fx, fy
+        points3D: [M, 3] COLMAP 3D points (used internally for normalization)
+    """
+    from datasets.read_write_model import (
+        read_model,
+        qvec2rotmat,
+    )
+    from datasets.normalize import (
+        similarity_from_cameras,
+        transform_cameras,
+        transform_points,
+        align_principle_axes,
+    )
+
+    cameras, images, points3D_dict = read_model(colmap_dir)
+    bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+
+    # Sort by image name for deterministic ordering
+    sorted_images = sorted(images.values(), key=lambda im: im.name)
+
+    camtoworlds = []
+    camera_info = []
+    Ks = []
+
+    for im in sorted_images:
+        R = qvec2rotmat(im.qvec)
+        t = im.tvec.reshape(3, 1)
+        w2c = np.concatenate([np.concatenate([R, t], 1), bottom], axis=0)
+        c2w = np.linalg.inv(w2c)
+        camtoworlds.append(c2w)
+
+        cam = cameras[im.camera_id]
+        model_name = cam.model
+        params = cam.params
+        w, h = cam.width, cam.height
+
+        # Extract focal length based on camera model
+        if model_name in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "SIMPLE_RADIAL_FISHEYE"):
+            fx = fy = params[0]
+            cx, cy = params[1], params[2]
+        elif model_name in ("PINHOLE", "RADIAL", "OPENCV", "OPENCV_FISHEYE",
+                            "FULL_OPENCV", "THIN_PRISM_FISHEYE"):
+            fx, fy = params[0], params[1]
+            cx, cy = params[2], params[3]
+        else:
+            fx = fy = params[0]
+            cx, cy = w / 2, h / 2
+
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        Ks.append(K)
+        camera_info.append({
+            "name": im.name,
+            "width": int(w),
+            "height": int(h),
+            "fx": float(fx),
+            "fy": float(fy),
+        })
+
+    camtoworlds = np.array(camtoworlds)
+
+    # Load 3D points from COLMAP for normalization
+    points3D = np.array([p.xyz for p in points3D_dict.values()], dtype=np.float32)
+    print(f"  Loaded {len(points3D)} COLMAP 3D points for normalization")
+
+    # Apply the same normalization as FreeTimeParser (datasets/FreeTime_dataset.py)
+    # This ensures cameras match the normalized Gaussian space in the checkpoint
+    T1 = similarity_from_cameras(camtoworlds)
+    camtoworlds = transform_cameras(T1, camtoworlds)
+    points3D = transform_points(T1, points3D)
+
+    T2 = align_principle_axes(points3D)
+    camtoworlds = transform_cameras(T2, camtoworlds)
+    points3D = transform_points(T2, points3D)
+
+    print(f"  Applied scene normalization (similarity + PCA alignment)")
+
+    return camtoworlds, np.array(Ks), camera_info, points3D
+
+
+def make_camera_presets(
+    camtoworlds: np.ndarray,
+    Ks: np.ndarray,
+    camera_info: List[dict],
+    max_presets: int = 12,
+) -> List[dict]:
+    """Create camera presets from COLMAP cameras for the web viewer.
+
+    Selects evenly-spaced cameras and converts their c2w matrices to
+    column-major float[16] for PlayCanvas Mat4.set().
+    """
+    n = len(camtoworlds)
+    if n <= max_presets:
+        indices = list(range(n))
+    else:
+        indices = np.linspace(0, n - 1, max_presets, dtype=int).tolist()
+
+    presets = []
+    for i in indices:
+        c2w = camtoworlds[i]  # [4, 4] row-major
+        info = camera_info[i]
+        K = Ks[i]
+        fx = K[0, 0]
+        h = info["height"]
+        fov_y = 2 * math.atan(h / (2 * fx)) * (180 / math.pi)
+
+        # PlayCanvas Mat4.set() expects column-major order
+        world_matrix = c2w.T.flatten().tolist()
+
+        name = os.path.splitext(info["name"])[0]
+        presets.append({
+            "name": name,
+            "position": c2w[:3, 3].tolist(),
+            "worldMatrix": world_matrix,
+            "fov": round(fov_y, 2),
+        })
+    return presets
 
 
 def write_params_bin(
@@ -175,14 +335,19 @@ def main() -> None:
                         help="Max SH degree to export (0=DC only, greatly reduces PLY size)")
     parser.add_argument("--max-splats", type=int, default=0,
                         help="Random downsample to at most N splats (0=no limit)")
-    parser.add_argument("--max-scale", type=float, default=0.1,
-                        help="Max allowed exp(scale) per axis; splats exceeding this are removed (0=no limit)")
-    parser.add_argument("--max-aspect-ratio", type=float, default=50.0,
-                        help="Max allowed scale aspect ratio (max/min); needle-like splats exceeding this are removed (0=no limit)")
+    parser.add_argument("--max-scale", type=float, default=0,
+                        help="Max allowed exp(scale) per axis; splats exceeding this are removed "
+                             "(0=no limit, matching trainer behavior — RECOMMENDED)")
+    parser.add_argument("--max-aspect-ratio", type=float, default=0,
+                        help="Max allowed scale aspect ratio (max/min); needle-like splats exceeding this are removed "
+                             "(0=no limit, matching trainer behavior — RECOMMENDED)")
     parser.add_argument("--sog", action="store_true", help="Also export canonical.sog using splat-transform")
     parser.add_argument("--sog-iterations", type=int, default=10, help="SOG compression iterations")
     parser.add_argument("--sog-gpu", type=str, default=None, help="GPU adapter index or 'cpu' for SOG compression")
     parser.add_argument("--sog-cli", type=str, default=None, help="Custom splat-transform command")
+    parser.add_argument("--colmap-dir", type=str, default=None,
+                        help="Path to COLMAP sparse model (e.g. dataset/dance/colmap/sparse/0). "
+                             "Enables lookatCenter and camera presets in scene_meta.json")
 
     args = parser.parse_args()
 
@@ -315,29 +480,31 @@ def main() -> None:
     scene_radius = float(np.percentile(dists, 95))
 
     # --- Compute recommended viewer parameters from actual data ---
-    # These match the trainer's behavior (no artificial caps)
+    # Goal: match the Python trainer/viewer as closely as possible.
+    # The trainer applies NO cap on scale or displacement.
+    # We set generous soft caps that cover 99.9% of splats.
     exp_scales = np.exp(np.clip(scales_log, -20, 20))
-    max_scale_p99 = float(np.percentile(exp_scales.max(axis=1), 99.5))
-    # Use 2x the 99.5th percentile as safe max, but at least 0.1
-    recommended_max_scale = max(round(max_scale_p99 * 2, 3), 0.1)
+    max_scale_p999 = float(np.percentile(exp_scales.max(axis=1), 99.9))
+    # Use 1.5x 99.9th percentile — soft cap in shader, not removal
+    recommended_max_scale = max(round(max_scale_p999 * 1.5, 3), 0.3)
 
     vel_mags = np.linalg.norm(velocities, axis=1)
     times_flat = times.reshape(-1)
     max_dt = np.maximum(np.abs(0 - times_flat), np.abs(1 - times_flat))
     max_disps = vel_mags * max_dt
-    max_disp_p99 = float(np.percentile(max_disps, 99))
-    # Use 1.5x the 99th percentile, but at least 1.0
-    recommended_max_disp = max(round(max_disp_p99 * 1.5, 2), 1.0)
+    max_disp_p999 = float(np.percentile(max_disps, 99.9))
+    # Use 2x 99.9th percentile — generous to avoid clipping motion
+    recommended_max_disp = max(round(max_disp_p999 * 2.0, 2), 2.0)
 
     aspect_ratios = exp_scales.max(axis=1) / (exp_scales.min(axis=1) + 1e-10)
-    recommended_max_aspect = float(min(np.percentile(aspect_ratios, 99), 100.0))
+    recommended_max_aspect = float(min(np.percentile(aspect_ratios, 99.5), 200.0))
 
-    print(f"  Recommended viewer params:")
-    print(f"    maxSplatScale: {recommended_max_scale}")
-    print(f"    maxDisplacement: {recommended_max_disp}")
+    print(f"  Recommended viewer params (trainer-matching):")
+    print(f"    maxSplatScale: {recommended_max_scale} (p99.9={max_scale_p999:.4f})")
+    print(f"    maxDisplacement: {recommended_max_disp} (p99.9={max_disp_p999:.4f})")
     print(f"    maxAspectRatio: {recommended_max_aspect:.1f}")
 
-    meta = {
+    meta: dict = {
         "center": scene_center,
         "radius": scene_radius,
         "numSplats": int(means.shape[0]),
@@ -349,6 +516,35 @@ def main() -> None:
             "temporalThreshold": 0.01,
         },
     }
+
+    # --- Load COLMAP cameras → lookatCenter + camera presets ---
+    if args.colmap_dir:
+        try:
+            print(f"\nLoading COLMAP cameras from {args.colmap_dir} ...")
+            camtoworlds, Ks, camera_info, _ = load_colmap_cameras(args.colmap_dir)
+            print(f"  Loaded {len(camtoworlds)} cameras (normalized to training space)")
+
+            # Compute lookatCenter (same as traj.py's focus_point_fn)
+            poses_34 = camtoworlds[:, :3, :]  # [N, 3, 4]
+            lookat_center = focus_point_fn(poses_34).tolist()
+            meta["lookatCenter"] = lookat_center
+            print(f"  lookatCenter (focus_point_fn): "
+                  f"({lookat_center[0]:.3f}, {lookat_center[1]:.3f}, {lookat_center[2]:.3f})")
+
+            # Camera presets
+            presets = make_camera_presets(camtoworlds, Ks, camera_info, max_presets=12)
+            meta["cameraPresets"] = presets
+            print(f"  Exported {len(presets)} camera presets: "
+                  f"{[p['name'] for p in presets]}")
+
+        except Exception as e:
+            print(f"  [WARNING] Failed to load COLMAP cameras: {e}")
+            print(f"  Continuing without camera presets...")
+    else:
+        print("\n[NOTE] --colmap-dir not specified. No camera presets or lookatCenter.")
+        print("  To get training-quality camera views, re-run with:")
+        print(f"    --colmap-dir dataset/dance/colmap/sparse/0")
+
     meta_path = os.path.join(args.output_dir, "scene_meta.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)

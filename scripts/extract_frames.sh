@@ -5,8 +5,8 @@
 set -euo pipefail
 
 # --- デフォルトパラメータ ---
-VIDEO_DIR="${VIDEO_DIR:-$(pwd)/dance}"     # 入力動画ディレクトリ
-OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/dataset/selfcap_dance/images}"  # 出力画像ディレクトリ
+VIDEO_DIR="${VIDEO_DIR:-$(pwd)/movies/dance}"     # 入力動画ディレクトリ
+OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/dataset/dance/images}"  # 出力画像ディレクトリ
 NUM_CAMERAS="${NUM_CAMERAS:-24}"           # カメラ台数
 NUM_FRAMES="${NUM_FRAMES:-60}"            # 抽出フレーム数
 START_FRAME="${START_FRAME:-0}"           # 抽出開始フレーム番号（0=先頭から）
