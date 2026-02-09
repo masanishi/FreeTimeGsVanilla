@@ -418,8 +418,6 @@ def main():
                         help="リファレンスカメラID（このカメラと他カメラでペアマッチする）")
     parser.add_argument("--image-ext", default="png",
                         help="画像ファイルの拡張子")
-    parser.add_argument("--matcher", choices=["roma"], default="roma",
-                        help="マッチングアルゴリズム（現在はromaのみ）")
     parser.add_argument("--device", choices=["auto", "cuda", "mps"], default="auto",
                         help="使用デバイス（auto=CUDA優先、なければMPS）")
     parser.add_argument("--certainty", type=float, default=0.3,
@@ -441,8 +439,10 @@ def main():
     parser.add_argument("--no-upsample", action="store_true",
                         help="RoMaのアップサンプリングpassを無効化する "
                              "(解像度 864→560 に下がるがVRAMを大幅に削減)")
-    parser.add_argument("--cache-dir", default="",
-                        help="モデルキャッシュディレクトリ（未使用）")
+    parser.add_argument("--batch-size", type=int, default=5,
+                        help="1サブプロセスで処理するフレーム数 (デフォルト: 5)。"
+                             "大きくするとモデルロード回数が減り高速化するが、"
+                             "VRAMリークが蓄積する。5-10推奨。")
     # 内部用: サブプロセスワーカーモードフラグ（ユーザーは使用しない）
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
 
@@ -481,27 +481,36 @@ def main():
 
         frame_range = list(range(args.frame_start, args.frame_end + 1, args.frame_step))
         total = len(frame_range)
-        print(f"[MASTER] Subprocess-per-frame mode for complete VRAM isolation")
+        batch_size = max(1, args.batch_size)
+        # フレームリストをbatch_size個ずつのチャンクに分割
+        chunks = [frame_range[i:i + batch_size] for i in range(0, len(frame_range), batch_size)]
+        num_chunks = len(chunks)
+        print(f"[MASTER] Batched subprocess mode (batch_size={batch_size})")
         print(f"[MASTER] Frames: {args.frame_start} → {args.frame_end} (step={args.frame_step}, total={total})")
+        print(f"[MASTER] Split into {num_chunks} subprocess(es): "
+              f"モデルロード {total}回 → {num_chunks}回 に削減")
 
         failed_frames = []
-        for i, frame_idx in enumerate(frame_range):
+        for chunk_idx, chunk in enumerate(chunks):
+            chunk_start = chunk[0]
+            chunk_end = chunk[-1]
             print(f"\n{'='*60}")
-            print(f"[MASTER] Frame {frame_idx:06d}  ({i+1}/{total})")
+            print(f"[MASTER] Batch {chunk_idx+1}/{num_chunks}: "
+                  f"frames {chunk_start:06d}-{chunk_end:06d} ({len(chunk)} frames)")
             print(f"{'='*60}")
 
             # 自身を --_worker モードで起動するコマンドを構築
+            # frame-start/frame-end でチャンクの範囲を指定
             cmd = [
                 sys.executable, os.path.abspath(__file__),
                 '--images-dir', str(args.images_dir),
                 '--colmap-model', str(args.colmap_model),
                 '--output-dir', str(args.output_dir),
-                '--frame-start', str(frame_idx),
-                '--frame-end', str(frame_idx),
-                '--frame-step', '1',
+                '--frame-start', str(chunk_start),
+                '--frame-end', str(chunk_end),
+                '--frame-step', str(args.frame_step),
                 '--ref-cam', args.ref_cam,
                 '--image-ext', args.image_ext,
-                '--matcher', args.matcher,
                 '--device', args.device,
                 '--certainty', str(args.certainty),
                 '--max-matches', str(args.max_matches),
@@ -516,20 +525,19 @@ def main():
                 cmd.append('--amp')
             if args.no_upsample:
                 cmd.append('--no-upsample')
-            if args.cache_dir:
-                cmd += ['--cache-dir', args.cache_dir]
             cmd.append('--_worker')
 
             result = subprocess.run(cmd)
             if result.returncode != 0:
-                print(f"[MASTER][ERROR] Frame {frame_idx:06d} failed (exit code: {result.returncode})")
-                failed_frames.append(frame_idx)
+                print(f"[MASTER][ERROR] Batch {chunk_idx+1} (frames {chunk_start:06d}-{chunk_end:06d}) "
+                      f"failed (exit code: {result.returncode})")
+                failed_frames.extend(chunk)
 
         print(f"\n{'='*60}")
         if failed_frames:
             print(f"[MASTER] Completed with {len(failed_frames)} failed frame(s): {failed_frames}")
         else:
-            print(f"[MASTER] All {total} frames completed successfully.")
+            print(f"[MASTER] All {total} frames completed successfully ({num_chunks} batches).")
         return
 
     # ====== WORKER MODE: 単一フレーム（またはフレーム範囲）を処理 ======
