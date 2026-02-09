@@ -270,11 +270,53 @@ def step0_configure(args) -> dict:
         result_dir = Path(raw).resolve()
 
     # --- フレーム数 / FPS ---
-    start_frame = args.start_frame or 0
-    num_frames = args.num_frames or 60
-    fps = args.fps or 60
-    keyframe_step = args.keyframe_step or 5
-    max_steps = args.max_steps or 50000
+    if args.start_frame is None:
+        start_frame = 0 if args.yes else IntPrompt.ask(
+            "[bold]抽出開始フレーム番号を入力してください[/]",
+            default=0,
+        )
+    else:
+        start_frame = args.start_frame
+
+    if args.fps is None:
+        fps = 60 if args.yes else IntPrompt.ask(
+            "[bold]抽出FPSを入力してください[/]",
+            default=60,
+        )
+    else:
+        fps = args.fps
+
+    if args.num_frames is None:
+        num_frames = 60 if args.yes else IntPrompt.ask(
+            "[bold]抽出フレーム数を入力してください[/]",
+            default=60,
+        )
+    else:
+        num_frames = args.num_frames
+
+    if args.keyframe_step is None:
+        keyframe_step = 5 if args.yes else IntPrompt.ask(
+            "[bold]キーフレーム間隔を入力してください[/]",
+            default=5,
+        )
+    else:
+        keyframe_step = args.keyframe_step
+
+    if args.max_steps is None:
+        max_steps = 50000 if args.yes else IntPrompt.ask(
+            "[bold]トレーニングステップ数を入力してください[/]",
+            default=50000,
+        )
+    else:
+        max_steps = args.max_steps
+
+    if args.batch_size is None:
+        batch_size = 5 if args.yes else IntPrompt.ask(
+            "[bold]RoMaバッチサイズ（1サブプロセスあたりのフレーム数）を入力してください[/]",
+            default=5,
+        )
+    else:
+        batch_size = args.batch_size
 
     # --- サマリー表示 ---
     console.print()
@@ -290,6 +332,7 @@ def step0_configure(args) -> dict:
     summary.add_row("FPS", str(fps))
     summary.add_row("キーフレーム間隔", str(keyframe_step))
     summary.add_row("トレーニングステップ数", str(max_steps))
+    summary.add_row("RoMaバッチサイズ", str(batch_size))
     summary.add_row("GPU ID", str(args.gpu_id))
     console.print(summary)
     console.print()
@@ -308,6 +351,7 @@ def step0_configure(args) -> dict:
         "fps": fps,
         "keyframe_step": keyframe_step,
         "max_steps": max_steps,
+        "batch_size": batch_size,
         "gpu_id": args.gpu_id,
         "auto_yes": args.yes,
     }
@@ -470,6 +514,7 @@ def step3_roma(cfg: dict) -> str:
             "--min-depth", "1e-4",
             "--image-scale", "1.0",
             "--voxel-size", "0",
+            "--batch-size", str(cfg["batch_size"]),
         ],
         env=extra_env,
     )
@@ -685,6 +730,8 @@ def parse_args():
                         help="キーフレーム間隔 (default: 5)")
     parser.add_argument("--max-steps", type=int, default=None,
                         help="トレーニングステップ数 (default: 50000)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="RoMa三角測量の1サブプロセスあたりのフレーム数 (default: 5)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="全ての確認プロンプトに自動でYesを返す")
     return parser.parse_args()
