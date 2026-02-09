@@ -336,7 +336,7 @@ class Config:
     """Prune Gaussians with opacity below this (more aggressive than relocation threshold)."""
 
     # ==================== Training ====================
-    max_steps: int = 70_000
+    max_steps: int = 60_000
     """Total number of training iterations."""
 
     batch_size: int = 1
@@ -392,9 +392,9 @@ class Config:
     lambda_perc: float = 0.01
     """Weight for LPIPS perceptual loss."""
 
-    lambda_4d_reg: float = 1e-3
+    lambda_4d_reg: float = 1e-2
     """Weight for 4D regularization loss: Lreg = (1/N) * Σ(σ * stop_grad[σ(t)]).
-    Paper value: λreg = 1e-2. Reduced to 1e-3 to prevent over-suppression."""
+    Paper value: λreg = 1e-2."""
 
     lambda_duration_reg: float = 1e-3
     """Weight for duration regularization. Penalizes wide temporal windows
@@ -1671,7 +1671,7 @@ class FreeTime4DRunner:
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
         # Reinitialize splats from checkpoint (handles size mismatch from densification)
         ckpt_splats = ckpt["splats"]
@@ -3246,7 +3246,7 @@ if __name__ == "__main__":
                 packed=True,                  # CRITICAL for 8M+ Gaussians
 
                 # ============ Regularization ============
-                lambda_4d_reg=1e-4,           # Gentle 4D regularization
+                lambda_4d_reg=1e-2,           # Paper optimal: λreg = 1e-2
                 lambda_duration_reg=1e-3,     # Light duration regularization
 
                 # ============ Random Background ============
@@ -3290,7 +3290,7 @@ if __name__ == "__main__":
                 packed=True,
 
                 # ============ Regularization ============
-                lambda_4d_reg=1e-4,
+                lambda_4d_reg=1e-2,           # Paper optimal: λreg = 1e-2
                 lambda_duration_reg=1e-3,
 
                 # ============ Random Background ============
