@@ -625,12 +625,86 @@ def step5_train(cfg: dict, npz_path: Path) -> str:
     table.add_row("result-dir", str(result_dir))
     table.add_row("フレーム範囲", f"0 → {num_frames + 1}")
     table.add_row("max-steps", str(max_steps))
+    table.add_row("チェックポイント間隔", "10000ステップ毎")
     table.add_row("GPU (CUDA_VISIBLE_DEVICES)", str(gpu_id))
     console.print(table)
     console.print()
 
     if not confirm("トレーニングを開始しますか？", cfg["auto_yes"]):
         console.print("[yellow]トレーニングをスキップしました。[/]")
+        return "skip"
+
+    # 10000ステップ間隔でチェックポイントと評価を実行
+    save_eval_steps = list(range(10000, max_steps + 1, 10000))
+    if max_steps not in save_eval_steps:
+        save_eval_steps.append(max_steps)
+    steps_str = [str(s) for s in save_eval_steps]
+
+    console.print(f"[dim]チェックポイント保存ステップ: {save_eval_steps}[/]")
+    console.print(STEP_STYLES["run"])
+    rc = run_cmd(
+        [
+            str(VENV_PYTHON), "src/simple_trainer_freetime_4d_pure_relocation.py",
+            "default_keyframe",
+            "--data-dir", str(data_dir),
+            "--init-npz-path", str(npz_path),
+            "--result-dir", str(result_dir),
+            "--start-frame", "0",
+            "--end-frame", str(num_frames + 1),
+            "--max-steps", str(max_steps),
+            "--eval-steps", *steps_str,
+            "--save-steps", *steps_str,
+        ],
+        env={"CUDA_VISIBLE_DEVICES": str(gpu_id)},
+    )
+    if rc != 0:
+        fail_and_exit("トレーニング", rc)
+
+    console.print(STEP_STYLES["done"])
+    return "done"
+
+
+# ============================================================
+# Step 6: PLY エクスポート
+# ============================================================
+def step6_export_ply(cfg: dict, npz_path: Path) -> str:
+    """最終チェックポイントからPLYシーケンスをエクスポートする。"""
+    step_header(6, "PLY エクスポート")
+
+    result_dir = cfg["result_dir"]
+    data_dir = cfg["data_dir"]
+    num_frames = cfg["num_frames"]
+    gpu_id = cfg["gpu_id"]
+
+    # 最終チェックポイントを探す
+    ckpt_dir = result_dir / "ckpts"
+    if not ckpt_dir.exists():
+        console.print("[red]チェックポイントディレクトリが見つかりません[/]")
+        console.print(STEP_STYLES["fail"])
+        return "fail"
+
+    ckpts = sorted(ckpt_dir.glob("ckpt_*.pt"))
+    if not ckpts:
+        console.print("[red]チェックポイントファイルが見つかりません[/]")
+        console.print(STEP_STYLES["fail"])
+        return "fail"
+
+    latest_ckpt = ckpts[-1]
+    size_mb = latest_ckpt.stat().st_size / (1024 * 1024)
+    console.print(f"[bold]使用するチェックポイント:[/] [bright_green]{latest_ckpt.name}[/] ({size_mb:.1f} MB)")
+
+    # 既存PLYディレクトリの確認
+    ply_dirs = sorted(result_dir.glob("ply_sequence_step*"))
+    if ply_dirs:
+        latest_ply = ply_dirs[-1]
+        ply_count = len(list(latest_ply.glob("*.ply")))
+        console.print(f"[green]PLYシーケンスが既に存在します:[/] {latest_ply.name} ({ply_count} frames)")
+        if confirm("既存のPLYをそのまま使いますか？（Noで再エクスポート）", cfg["auto_yes"]):
+            console.print(STEP_STYLES["skip"])
+            return "skip"
+
+    if not confirm("PLYシーケンスをエクスポートしますか？", cfg["auto_yes"]):
+        console.print(STEP_STYLES["skip"])
         return "skip"
 
     console.print(STEP_STYLES["run"])
@@ -643,14 +717,24 @@ def step5_train(cfg: dict, npz_path: Path) -> str:
             "--result-dir", str(result_dir),
             "--start-frame", "0",
             "--end-frame", str(num_frames + 1),
-            "--max-steps", str(max_steps),
-            "--eval-steps", str(max_steps),
-            "--save-steps", str(max_steps),
+            "--ckpt-path", str(latest_ckpt),
+            "--export-only",
+            "--export-ply",
+            "--export-ply-format", "ply",
         ],
         env={"CUDA_VISIBLE_DEVICES": str(gpu_id)},
     )
     if rc != 0:
-        fail_and_exit("トレーニング", rc)
+        fail_and_exit("PLY エクスポート", rc)
+
+    # エクスポート結果の確認
+    ply_dirs = sorted(result_dir.glob("ply_sequence_step*"))
+    if ply_dirs:
+        latest_ply = ply_dirs[-1]
+        ply_files = sorted(latest_ply.glob("*.ply"))
+        total_size_mb = sum(f.stat().st_size for f in ply_files) / (1024 * 1024)
+        console.print(f"[green]PLYエクスポート完了:[/] {len(ply_files)} frames, 合計 {total_size_mb:.1f} MB")
+        console.print(f"  [dim]{latest_ply}[/]")
 
     console.print(STEP_STYLES["done"])
     return "done"
@@ -674,8 +758,9 @@ def print_summary(cfg: dict, npz_path: Path, results: dict[str, str]):
         "3. RoMa 三角測量",
         "4. キーフレーム結合",
         "5. トレーニング",
+        "6. PLY エクスポート",
     ]
-    for name, key in zip(step_names, ["extract", "colmap", "roma", "combine", "train"]):
+    for name, key in zip(step_names, ["extract", "colmap", "roma", "combine", "train", "ply"]):
         status = results.get(key, "—")
         if status == "done":
             table.add_row(name, STEP_STYLES["done"])
@@ -694,6 +779,10 @@ def print_summary(cfg: dict, npz_path: Path, results: dict[str, str]):
     paths.add_row("三角測量", str(cfg["data_dir"] / "triangulation"))
     paths.add_row("NPZ", str(npz_path))
     paths.add_row("トレーニング結果", str(cfg["result_dir"]))
+    # PLYディレクトリがあれば表示
+    ply_dirs = sorted(cfg["result_dir"].glob("ply_sequence_step*"))
+    if ply_dirs:
+        paths.add_row("PLY シーケンス", str(ply_dirs[-1]))
     console.print(paths)
     console.print()
 
@@ -766,6 +855,10 @@ def main():
 
     # Step 5: トレーニング
     results["train"] = step5_train(cfg, npz_path)
+    console.print()
+
+    # Step 6: PLY エクスポート
+    results["ply"] = step6_export_ply(cfg, npz_path)
 
     # サマリー
     print_summary(cfg, npz_path, results)
