@@ -17,7 +17,7 @@ DATA_DIR="${DATA_DIR:-$(pwd)/dataset/dance}"        # データ出力ルート
 NUM_CAMERAS="${NUM_CAMERAS:-24}"    # カメラ台数
 NUM_FRAMES="${NUM_FRAMES:-60}"     # フレーム数（60fps前提で1秒分）
 FPS="${FPS:-60}"                   # 抽出FPS（4K 60fps動画からの抽出を想定）
-RESIZE_SCALE="${RESIZE_SCALE:-1}"  # リサイズ倍率（1=4K原寸維持、0.5で半分）
+RESIZE_SCALE="${RESIZE_SCALE:-0.5}"  # リサイズ倍率（0.5=論文準拠、1920x1080。1=4K原寸維持）
 KEYFRAME_STEP="${KEYFRAME_STEP:-5}"  # キーフレーム間隔（速度推定用）
 
 # --- RoMa三角測量パラメータ ---
@@ -27,7 +27,7 @@ ROMA_CERTAINTY="${ROMA_CERTAINTY:-0.3}"    # マッチング確信度しきい�
 ROMA_MIN_DEPTH="${ROMA_MIN_DEPTH:-1e-4}"   # 最小深度フィルタ
 ROMA_IMAGE_SCALE="${ROMA_IMAGE_SCALE:-1.0}"  # RoMa入力画像のスケーリング
 ROMA_AMP="${ROMA_AMP:-0}"                  # AMP (FP16混合精度) 0=無効
-ROMA_USE_RANSAC="${ROMA_USE_RANSAC:-0}"    # RANSAC外れ値除去 0=無効
+ROMA_USE_RANSAC="${ROMA_USE_RANSAC:-1}"    # RANSAC外れ値除去 1=有効（デフォルト有効、論文推奨）
 ROMA_RANSAC_TH="${ROMA_RANSAC_TH:-0.5}"   # RANSACピクセル誤差しきい値
 ROMA_VOXEL_SIZE="${ROMA_VOXEL_SIZE:-0}"    # ボクセルダウンサンプリング（0=無効）
 ROMA_NO_UPSAMPLE="${ROMA_NO_UPSAMPLE:-0}" # RoMaアップサンプリング無効化（0=有効/精度優先）

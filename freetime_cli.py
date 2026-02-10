@@ -318,6 +318,14 @@ def step0_configure(args) -> dict:
     else:
         batch_size = args.batch_size
 
+    if args.resize_scale is None:
+        resize_scale = 0.5 if args.yes else float(Prompt.ask(
+            "[bold]フレーム抽出時のリサイズ倍率を入力してください（0.5=論文準拠 1920x1080, 1=4K原寸）[/]",
+            default="0.5",
+        ))
+    else:
+        resize_scale = args.resize_scale
+
     # --- サマリー表示 ---
     console.print()
     summary = Table(title="パイプライン設定", border_style="bright_magenta", show_lines=True)
@@ -332,6 +340,7 @@ def step0_configure(args) -> dict:
     summary.add_row("FPS", str(fps))
     summary.add_row("キーフレーム間隔", str(keyframe_step))
     summary.add_row("トレーニングステップ数", str(max_steps))
+    summary.add_row("リサイズ倍率", str(resize_scale))
     summary.add_row("RoMaバッチサイズ", str(batch_size))
     summary.add_row("GPU ID", str(args.gpu_id))
     console.print(summary)
@@ -352,6 +361,7 @@ def step0_configure(args) -> dict:
         "keyframe_step": keyframe_step,
         "max_steps": max_steps,
         "batch_size": batch_size,
+        "resize_scale": resize_scale,
         "gpu_id": args.gpu_id,
         "auto_yes": args.yes,
     }
@@ -408,6 +418,7 @@ def step1_extract_frames(cfg: dict) -> str:
         "--num-frames", str(num_frames),
         "--start-frame", str(cfg["start_frame"]),
         "--fps", str(cfg["fps"]),
+        "--resize-scale", str(cfg["resize_scale"]),
     ])
     if rc != 0:
         fail_and_exit("フレーム抽出", rc)
@@ -514,6 +525,7 @@ def step3_roma(cfg: dict) -> str:
             "--min-depth", "1e-4",
             "--image-scale", "1.0",
             "--voxel-size", "0",
+            "--use-ransac",
             "--batch-size", str(cfg["batch_size"]),
         ],
         env=extra_env,
@@ -821,6 +833,8 @@ def parse_args():
                         help="トレーニングステップ数 (default: 50000)")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="RoMa三角測量の1サブプロセスあたりのフレーム数 (default: 5)")
+    parser.add_argument("--resize-scale", type=float, default=None,
+                        help="フレーム抽出時のリサイズ倍率 (default: 0.5, 論文準拠 4K→1920x1080)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="全ての確認プロンプトに自動でYesを返す")
     return parser.parse_args()

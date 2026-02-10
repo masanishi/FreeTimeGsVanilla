@@ -10,7 +10,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/dataset/dance/images}"  # 出力画像ディレ
 NUM_CAMERAS="${NUM_CAMERAS:-24}"           # カメラ台数
 NUM_FRAMES="${NUM_FRAMES:-60}"            # 抽出フレーム数
 START_FRAME="${START_FRAME:-0}"           # 抽出開始フレーム番号（0=先頭から）
-RESIZE_SCALE="${RESIZE_SCALE:-1}"         # リサイズ倍率（1=4K原寸維持）
+RESIZE_SCALE="${RESIZE_SCALE:-0.5}"       # リサイズ倍率（0.5=論文準拠、1920x1080。1=4K原寸維持）
 FPS="${FPS:-60}"                          # 抽出FPS（元動画のFPSに依存せず指定FPSで抽出）
 
 # --- ヘルプ表示 ---

@@ -422,8 +422,10 @@ def main():
                         help="使用デバイス（auto=CUDA優先、なければMPS）")
     parser.add_argument("--certainty", type=float, default=0.3,
                         help="RoMa確信度しきい値（0.0-1.0、低いほどマッチが多い）")
-    parser.add_argument("--use-ransac", action="store_true",
-                        help="RANSACで外れ値マッチを除去する")
+    parser.add_argument("--use-ransac", action="store_true", default=True,
+                        help="RANSACで外れ値マッチを除去する（デフォルト有効）")
+    parser.add_argument("--no-ransac", action="store_true",
+                        help="RANSAC外れ値除去を無効にする")
     parser.add_argument("--ransac-th", type=float, default=0.5,
                         help="RANSACのピクセル誤差しきい値")
     parser.add_argument("--min-depth", type=float, default=1e-4,
@@ -447,6 +449,10 @@ def main():
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # --no-ransac が指定された場合、RANSAC を無効にする
+    if args.no_ransac:
+        args.use_ransac = False
 
     # ==================================================================
     # サブプロセス分離モード (MASTER / WORKER)
@@ -521,6 +527,8 @@ def main():
             ]
             if args.use_ransac:
                 cmd.append('--use-ransac')
+            else:
+                cmd.append('--no-ransac')
             if args.amp:
                 cmd.append('--amp')
             if args.no_upsample:

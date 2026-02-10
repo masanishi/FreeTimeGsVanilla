@@ -84,6 +84,7 @@ colmap feature_extractor \
   --database_path "$DB_PATH" \
   --image_path "$CALIB_DIR" \
   --ImageReader.single_camera 0 \
+  --ImageReader.camera_model OPENCV \
   --FeatureExtraction.use_gpu 1 \
   --SiftExtraction.max_num_features 12000 \
   --SiftExtraction.peak_threshold 0.01
